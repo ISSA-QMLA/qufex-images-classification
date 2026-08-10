@@ -41,7 +41,7 @@ def main() -> None:
             trainer.resume(_resolve_override(args.resume, config.paths.project_root))
         best = trainer.run()
         print(f"Best checkpoint: {best}")
-    except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+    except (ConfigError, OSError, ValueError) as exc:
         parser.error(str(exc))
 
 

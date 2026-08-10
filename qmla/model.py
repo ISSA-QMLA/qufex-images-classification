@@ -10,8 +10,7 @@ try:
     from torch import nn
 except ImportError as exc:  # pragma: no cover - depends on machine-specific PyTorch
     raise ImportError(
-        "qmla.model requires PyTorch. Install the CUDA/CPU build appropriate for this machine; "
-        "PyTorch is intentionally not declared as a project dependency."
+        "qmla.model requires PyTorch. Install the CUDA/CPU build appropriate for this machine."
     ) from exc
 
 from qmla.config import AppConfig
@@ -65,6 +64,16 @@ class QuFeXLayer(nn.Module):
 
         @qml.qnode(device, interface="torch", diff_method=diff_method)
         def circuit(inputs: torch.Tensor, theta: torch.Tensor) -> Any:
+            # Make the simulator's initial state follow the Torch input device.
+            # Without this, default.qubit can create its implicit |0...0> state
+            # on CPU before applying a broadcasted CUDA AngleEmbedding.
+            initial_state = torch.zeros(
+                2**self.qubits,
+                dtype=inputs.dtype,
+                device=inputs.device,
+            )
+            initial_state[0] = 1.0
+            qml.StatePrep(initial_state, wires=range(self.qubits))
             qml.AngleEmbedding(
                 inputs * self.input_angle_scale,
                 wires=range(self.qubits),

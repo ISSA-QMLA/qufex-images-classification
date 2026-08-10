@@ -45,3 +45,22 @@ def test_classical_and_qufex_forward_and_gradient(tmp_path: Path) -> None:
         restored.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
         assert restored(inputs).shape == (2, 3)
 
+
+def test_default_qubit_broadcast_runs_on_cuda() -> None:
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    from qmla.model import QuFeXLayer
+
+    layer = QuFeXLayer(backend="default.qubit", diff_method="backprop").cuda()
+    inputs = torch.randn(2, 8, 2, 2, device="cuda", requires_grad=True)
+    outputs = layer(inputs)
+
+    assert outputs.shape == inputs.shape
+    assert outputs.device == inputs.device
+    outputs.square().mean().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert layer.theta.grad is not None and torch.isfinite(layer.theta.grad).all()
+
