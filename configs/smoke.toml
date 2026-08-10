@@ -13,18 +13,18 @@ train_fraction = 0.70
 validation_fraction = 0.15
 test_fraction = 0.15
 seed = 42
-num_workers = 2
+num_workers = 0
 preprocessing_batch_size = 256
 clean_label_policy = "hart_clean_flags"
 
 [model]
 mode = "qufex"
-encoder_channels = [16, 32, 64, 32]
+encoder_channels = [8, 8, 8, 8]
 convolutions_per_block = 1
 compression_channels = 8
 quantum_spatial_size = 2
-post_quantum_channels = [16]
-classifier_hidden_neurons = [32]
+post_quantum_channels = [8]
+classifier_hidden_neurons = [8]
 dropout = 0.20
 
 [quantum]
@@ -36,18 +36,18 @@ input_angle_scale = 3.141592653589793
 
 [training]
 device = "cuda"
-epochs = 3
-batch_size = 8
+epochs = 1
+batch_size = 2
 optimizer = "adamw"
 learning_rate = 0.001
 weight_decay = 0.0001
-early_stopping_patience = 8
+early_stopping_patience = 1
 amp = true
 class_weighting = true
 checkpoint_every = 1
 
 [evaluation]
-batch_size = 64
+batch_size = 2
 save_predictions = true
 save_confusion_matrix = true
 class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
