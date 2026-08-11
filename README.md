@@ -11,16 +11,20 @@ The quantum module follows the eight-qubit, four-parameter QuFeX v1 circuit from
 ## Architecture
 
 ```text
-128x128 RGB image
-  -> configurable Conv/BatchNorm/ReLU/Pool encoder
-  -> 8x8x32 feature tensor (default)
-  -> 1x1 compression + adaptive pooling
-  -> 2x2x8 bottleneck
+64x64 RGB image
+  -> five configurable Conv/BatchNorm/ReLU/Pool encoder blocks
+  -> 2x2x16 bottleneck (default)
   -> QuFeX residual (hybrid mode) or identity (classical mode)
   -> configurable CNN -> global average pool -> MLP -> 3 logits
 ```
 
-The `2x2x8` bottleneck is split into four `2x2x2` groups. Each group supplies eight angle-encoded values to the shared eight-qubit circuit. All batch/group inputs are broadcast through one QNode call.
+The default encoder follows `qcnn_res-small.ipynb`: channel widths `[4, 8, 8, 8, 16]`, two convolutions per block, and five 2x2 pooling operations reduce a `64x64x3` image directly to `2x2x16`. The default 8(1) QuFeX splits the bottleneck into eight adjacent-channel `2x2x2` groups. Each group supplies eight angle-encoded values to the same shared eight-qubit circuit. Even and odd Pauli-Z outputs are reshaped into two `2x2` maps, the eight group outputs are concatenated back to `2x2x16`, and the result is added residually to the encoder bottleneck.
+
+The published circuit families are selected with `quantum.qubits` and `quantum.filters`:
+
+- `qubits = 8`, `filters = 1`: mixes pairs of input maps and returns 16 maps;
+- `qubits = 4`, `filters = 1`: processes each input map separately and returns 16 maps;
+- `qubits = 4`, `filters = 2`: applies two independent circuits to each map and returns 32 maps. As in `qcnn_res-small4-2.ipynb`, the residual tensor is duplicated to 32 channels before addition.
 
 ## Installation
 
@@ -60,9 +64,9 @@ Relative data/output paths are resolved from `paths.project_root`, which is itse
 
 Important constraints for source-faithful QuFeX are validated:
 
-- `model.compression_channels = 8`;
+- `model.compression_channels = 16`;
 - `model.quantum_spatial_size = 2`;
-- `quantum.qubits = 8`.
+- `quantum.qubits` and `quantum.filters` must be `8/1`, `4/1`, or `4/2`.
 
 CLI values take precedence over TOML only for job-specific settings such as `--device`, `--model`, `--resume`, `--checkpoint`, and `--run-dir`.
 

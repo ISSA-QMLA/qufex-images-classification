@@ -81,7 +81,7 @@ class PathsConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    image_size: int = 128
+    image_size: int = 64
     train_fraction: float = 0.70
     validation_fraction: float = 0.15
     test_fraction: float = 0.15
@@ -94,9 +94,9 @@ class DataConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     mode: str = "qufex"
-    encoder_channels: tuple[int, ...] = (16, 32, 64, 32)
-    convolutions_per_block: int = 1
-    compression_channels: int = 8
+    encoder_channels: tuple[int, ...] = (4, 8, 8, 8, 16)
+    convolutions_per_block: int = 2
+    compression_channels: int = 16
     quantum_spatial_size: int = 2
     post_quantum_channels: tuple[int, ...] = (16,)
     classifier_hidden_neurons: tuple[int, ...] = (32,)
@@ -109,6 +109,7 @@ class QuantumConfig:
     diff_method: str = "backprop"
     shots: int = 0
     qubits: int = 8
+    filters: int = 1
     input_angle_scale: float = math.pi
 
 
@@ -154,12 +155,15 @@ class AppConfig:
             raise ConfigError("data.clean_label_policy currently supports only 'hart_clean_flags'")
         if self.model.mode not in {"qufex", "classical"}:
             raise ConfigError("model.mode must be 'qufex' or 'classical'")
-        if self.model.compression_channels != 8:
-            raise ConfigError("model.compression_channels must be 8 for the source-faithful QuFeX mapping")
+        if self.model.compression_channels != 16:
+            raise ConfigError("model.compression_channels must be 16 for the source-faithful QuFeX mapping")
         if self.model.quantum_spatial_size != 2:
             raise ConfigError("model.quantum_spatial_size must be 2 for the 2x2x2 QuFeX groups")
-        if self.quantum.qubits != 8:
-            raise ConfigError("quantum.qubits must be 8 for the QuFeX v1 circuit")
+        if (self.quantum.qubits, self.quantum.filters) not in {(8, 1), (4, 1), (4, 2)}:
+            raise ConfigError(
+                "quantum qubits/filters must select a published QuFeX variant: "
+                "8/1, 4/1, or 4/2"
+            )
         if not 0 <= self.model.dropout < 1:
             raise ConfigError("model.dropout must be in [0, 1)")
         if self.data.image_size < 2 ** len(self.model.encoder_channels):
@@ -237,7 +241,7 @@ def load_config(path: str | Path) -> AppConfig:
     data_raw = raw.get("data", {})
     _unknown_keys("data", data_raw, {"image_size", "train_fraction", "validation_fraction", "test_fraction", "seed", "num_workers", "preprocessing_batch_size", "clean_label_policy"})
     data = DataConfig(
-        image_size=_positive_int(data_raw.get("image_size", 128), "data.image_size"),
+        image_size=_positive_int(data_raw.get("image_size", 64), "data.image_size"),
         train_fraction=_positive_float(data_raw.get("train_fraction", 0.70), "data.train_fraction"),
         validation_fraction=_positive_float(data_raw.get("validation_fraction", 0.15), "data.validation_fraction"),
         test_fraction=_positive_float(data_raw.get("test_fraction", 0.15), "data.test_fraction"),
@@ -251,9 +255,9 @@ def load_config(path: str | Path) -> AppConfig:
     _unknown_keys("model", model_raw, {"mode", "encoder_channels", "convolutions_per_block", "compression_channels", "quantum_spatial_size", "post_quantum_channels", "classifier_hidden_neurons", "dropout"})
     model = ModelConfig(
         mode=_string(model_raw.get("mode", "qufex"), "model.mode").lower(),
-        encoder_channels=_int_tuple(model_raw.get("encoder_channels", [16, 32, 64, 32]), "model.encoder_channels"),
-        convolutions_per_block=_positive_int(model_raw.get("convolutions_per_block", 1), "model.convolutions_per_block"),
-        compression_channels=_positive_int(model_raw.get("compression_channels", 8), "model.compression_channels"),
+        encoder_channels=_int_tuple(model_raw.get("encoder_channels", [4, 8, 8, 8, 16]), "model.encoder_channels"),
+        convolutions_per_block=_positive_int(model_raw.get("convolutions_per_block", 2), "model.convolutions_per_block"),
+        compression_channels=_positive_int(model_raw.get("compression_channels", 16), "model.compression_channels"),
         quantum_spatial_size=_positive_int(model_raw.get("quantum_spatial_size", 2), "model.quantum_spatial_size"),
         post_quantum_channels=_int_tuple(model_raw.get("post_quantum_channels", [16]), "model.post_quantum_channels", allow_empty=True),
         classifier_hidden_neurons=_int_tuple(model_raw.get("classifier_hidden_neurons", [32]), "model.classifier_hidden_neurons", allow_empty=True),
@@ -261,12 +265,13 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     quantum_raw = raw.get("quantum", {})
-    _unknown_keys("quantum", quantum_raw, {"backend", "diff_method", "shots", "qubits", "input_angle_scale"})
+    _unknown_keys("quantum", quantum_raw, {"backend", "diff_method", "shots", "qubits", "filters", "input_angle_scale"})
     quantum = QuantumConfig(
         backend=_string(quantum_raw.get("backend", "default.qubit"), "quantum.backend"),
         diff_method=_string(quantum_raw.get("diff_method", "backprop"), "quantum.diff_method"),
         shots=_positive_int(quantum_raw.get("shots", 0), "quantum.shots", allow_zero=True),
         qubits=_positive_int(quantum_raw.get("qubits", 8), "quantum.qubits"),
+        filters=_positive_int(quantum_raw.get("filters", 1), "quantum.filters"),
         input_angle_scale=_positive_float(quantum_raw.get("input_angle_scale", math.pi), "quantum.input_angle_scale"),
     )
 

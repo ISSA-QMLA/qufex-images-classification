@@ -8,7 +8,7 @@ checkpoints_dir = "checkpoints"
 results_dir = "results"
 
 [data]
-image_size = 128
+image_size = 32
 train_fraction = 0.70
 validation_fraction = 0.15
 test_fraction = 0.15
@@ -21,7 +21,7 @@ clean_label_policy = "hart_clean_flags"
 mode = "qufex"
 encoder_channels = [8, 8, 8, 8]
 convolutions_per_block = 1
-compression_channels = 8
+compression_channels = 16
 quantum_spatial_size = 2
 post_quantum_channels = [8]
 classifier_hidden_neurons = [8]
@@ -32,6 +32,7 @@ backend = "default.qubit"
 diff_method = "backprop"
 shots = 0
 qubits = 8
+filters = 1
 input_angle_scale = 3.141592653589793
 
 [training]
@@ -51,4 +52,3 @@ batch_size = 2
 save_predictions = true
 save_confusion_matrix = true
 class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
-

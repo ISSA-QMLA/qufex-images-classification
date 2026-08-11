@@ -20,15 +20,16 @@ def test_one_epoch_resume_and_evaluation_smoke(tmp_path: Path) -> None:
     text = default.read_text(encoding="utf-8")
     replacements = {
         'project_root = ".."': f"project_root = {json.dumps(str(tmp_path))}",
-        "image_size = 128": "image_size = 32",
-        "num_workers = 8": "num_workers = 0",
+        "image_size = 64": "image_size = 32",
+        "num_workers = 2": "num_workers = 0",
         'mode = "qufex"': 'mode = "classical"',
-        "encoder_channels = [16, 32, 64, 32]": "encoder_channels = [4, 4, 4, 8]",
+        "encoder_channels = [4, 8, 8, 8, 16]": "encoder_channels = [4, 4, 4, 16]",
+        "convolutions_per_block = 2": "convolutions_per_block = 1",
         "post_quantum_channels = [16]": "post_quantum_channels = [4]",
         "classifier_hidden_neurons = [32]": "classifier_hidden_neurons = [4]",
         'device = "cuda"': 'device = "cpu"',
-        "epochs = 50": "epochs = 1",
-        "batch_size = 32": "batch_size = 4",
+        "epochs = 3": "epochs = 1",
+        "batch_size = 8": "batch_size = 4",
         "amp = true": "amp = false",
         "batch_size = 64": "batch_size = 4",
     }
