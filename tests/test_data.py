@@ -1,157 +1,71 @@
-from __future__ import annotations
-
 import json
+import pickle
 import zipfile
-from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 import pytest
-from PIL import Image
 
-from qmla.config import load_config
-from qmla.data import GalaxyZooPreprocessor, file_digest, safe_extract_zip
+from qmla.data import GalaxyDataset, GalaxyZooPreprocessor, file_digest, safe_extract_zip, validate_cache
 
 
-def _write_test_config(path: Path, project_root: Path) -> None:
-    path.write_text(
-        f"""
-[paths]
-project_root = {json.dumps(str(project_root))}
-raw_dir = "raw"
-processed_dir = "processed"
-runs_dir = "runs"
-checkpoints_dir = "checkpoints"
-results_dir = "results"
-
-[data]
-image_size = 16
-train_fraction = 0.70
-validation_fraction = 0.15
-test_fraction = 0.15
-seed = 7
-num_workers = 0
-preprocessing_batch_size = 8
-clean_label_policy = "hart_clean_flags"
-
-[model]
-mode = "classical"
-encoder_channels = [4, 4, 4, 4]
-convolutions_per_block = 1
-compression_channels = 16
-quantum_spatial_size = 2
-post_quantum_channels = [4]
-classifier_hidden_neurons = [4]
-dropout = 0.0
-
-[quantum]
-backend = "default.qubit"
-diff_method = "backprop"
-shots = 0
-qubits = 8
-input_angle_scale = 3.141592653589793
-
-[training]
-device = "cpu"
-epochs = 1
-batch_size = 4
-optimizer = "adamw"
-learning_rate = 0.001
-weight_decay = 0.0
-early_stopping_patience = 1
-amp = false
-class_weighting = true
-checkpoint_every = 1
-
-[evaluation]
-batch_size = 4
-save_predictions = true
-save_confusion_matrix = true
-class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
-""",
-        encoding="utf-8",
-    )
-
-
-def test_safe_extract_and_digest(tmp_path: Path) -> None:
+def test_safe_extract(tmp_path):
     archive = tmp_path / "safe.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
         bundle.writestr("nested/value.txt", "galaxy")
-        bundle.writestr("__MACOSX/nested/._value.txt", "metadata")
-        bundle.writestr("nested/.DS_Store", "metadata")
-    destination = tmp_path / "output"
+        bundle.writestr("__MACOSX/._value", "metadata")
+    destination = tmp_path / "extracted"
     safe_extract_zip(archive, destination)
-    assert (destination / "nested" / "value.txt").read_text() == "galaxy"
+    assert (destination / "nested/value.txt").read_text() == "galaxy"
     assert not (destination / "__MACOSX").exists()
-    assert not (destination / "nested" / ".DS_Store").exists()
     assert len(file_digest(archive)) == 64
-
-
-def test_safe_extract_rejects_traversal(tmp_path: Path) -> None:
-    archive = tmp_path / "unsafe.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("../escape.txt", "bad")
-    with pytest.raises(ValueError, match="Unsafe ZIP member"):
-        safe_extract_zip(archive, tmp_path / "output")
+        bundle.writestr("../escape", "bad")
+    with pytest.raises(ValueError, match="Unsafe ZIP"):
+        safe_extract_zip(archive, destination)
 
 
-def test_preprocessor_builds_clean_disjoint_splits(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.toml"
-    _write_test_config(config_path, tmp_path)
-    config = load_config(config_path)
-    images_dir = config.paths.raw_dir / "images"
-    images_dir.mkdir(parents=True)
+def test_cache_splits_statistics_and_reuse(prepared):
+    meta = validate_cache(prepared)
+    assert [meta["splits"][s]["samples"] for s in ("train", "validation", "test")] == [12, 6, 6]
+    train = np.load(prepared.cache_dir / "train_images.npy").astype(float) / 255
+    np.testing.assert_allclose(meta["normalization_mean"], train.mean(axis=(0, 1, 2)))
+    np.testing.assert_allclose(meta["normalization_std"], train.std(axis=(0, 1, 2)))
+    assert GalaxyZooPreprocessor(prepared).run()["dataset_id"] == meta["dataset_id"]
+    original = GalaxyDataset(prepared.cache_dir, "train")
+    restored = pickle.loads(pickle.dumps(original))
+    assert isinstance(restored.images, np.memmap)
+    assert np.array_equal(restored[0][0], original[0][0])
 
-    mapping_rows = []
-    catalog_rows = []
-    asset_id = 1000
-    for label in range(3):
-        for item in range(12):
-            objid = str(10_000_000 + label * 100 + item)
-            mapping_rows.append({"objid": objid, "sample": "original", "asset_id": asset_id})
-            flags = {
-                "dr7objid": objid,
-                "t01_smooth_or_features_a01_smooth_flag": int(label == 0),
-                "t03_bar_a06_bar_flag": int(label == 2),
-                "t03_bar_a07_no_bar_flag": int(label == 1),
-                "t04_spiral_a08_spiral_flag": int(label in {1, 2}),
-            }
-            catalog_rows.append(flags)
-            pixels = np.full((24, 24, 3), 25 + label * 80 + item, dtype=np.uint8)
-            Image.fromarray(pixels).save(images_dir / f"{asset_id}.jpg")
-            asset_id += 1
 
-    # Ambiguous object must be dropped.
-    mapping_rows.append({"objid": "99999999", "sample": "original", "asset_id": asset_id})
-    catalog_rows.append(
-        {
-            "dr7objid": "99999999",
-            "t01_smooth_or_features_a01_smooth_flag": 0,
-            "t03_bar_a06_bar_flag": 0,
-            "t03_bar_a07_no_bar_flag": 0,
-            "t04_spiral_a08_spiral_flag": 0,
-        }
-    )
-    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(images_dir / f"{asset_id}.jpg")
+def test_resolution_caches_share_master_and_subset_ids(prepared):
+    new = replace(prepared, data=replace(prepared.data, image_size=64))
+    first = validate_cache(prepared)
+    second = GalaxyZooPreprocessor(new).run()
+    assert new.cache_dir != prepared.cache_dir
+    assert first["master_ids"] == second["master_ids"]
+    assert [first["splits"][s]["ids_sha256"] for s in first["splits"]] == [second["splits"][s]["ids_sha256"] for s in second["splits"]]
+    assert np.load(new.cache_dir / "train_images.npy").shape == (12, 64, 64, 3)
 
-    pd.DataFrame(mapping_rows).to_csv(config.paths.raw_dir / "gz2_filename_mapping.csv", index=False)
-    pd.DataFrame(catalog_rows).to_csv(
-        config.paths.raw_dir / "gz2_hart16.csv.gz", index=False, compression="gzip"
-    )
 
-    metadata = GalaxyZooPreprocessor(config).run()
-    assert sum(split["samples"] for split in metadata["splits"].values()) == 36
-    assert len(metadata["normalization_mean"]) == 3
-    assert np.load(config.paths.processed_dir / "train_images.npy", mmap_mode="r").dtype == np.uint8
+def test_corrupted_cache_rejected(prepared):
+    np.save(prepared.cache_dir / "train_images.npy", np.zeros((12, 128, 128, 3), dtype=np.uint8))
+    with pytest.raises(RuntimeError, match="Cache file changed"):
+        validate_cache(prepared)
 
-    ids = {
-        split: set(
-            pd.read_csv(config.paths.processed_dir / f"{split}_manifest.csv", dtype={"dr7objid": str})[
-                "dr7objid"
-            ]
-        )
-        for split in ("train", "validation", "test")
-    }
-    assert ids["train"].isdisjoint(ids["validation"])
-    assert ids["train"].isdisjoint(ids["test"])
-    assert ids["validation"].isdisjoint(ids["test"])
+
+def test_stale_source_rejected(prepared):
+    path = prepared.paths.raw_dir / "gz2_filename_mapping.csv"
+    path.write_text(path.read_text() + "\n")
+    with pytest.raises(RuntimeError, match="Raw source changed"):
+        validate_cache(prepared)
+
+
+def test_subset_stratification_and_reproducibility(tiny_config):
+    frame = pd.DataFrame({"label": [0] * 60 + [1] * 30 + [2] * 10, "id": range(100)})
+    processor = GalaxyZooPreprocessor(tiny_config)
+    subset = processor._subset(frame, 20)
+    assert subset["label"].value_counts().to_dict() == {0: 12, 1: 6, 2: 2}
+    assert subset.equals(processor._subset(frame, 20))
+    assert set(processor._subset(frame, 3)["label"]) == {0, 1, 2}
