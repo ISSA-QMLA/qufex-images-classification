@@ -1,50 +1,28 @@
-"""Train one QuFeX or classical Galaxy Zoo classifier."""
-
-from __future__ import annotations
-
+"""Train the TOML-selected model/seed(s) and test each best checkpoint."""
 import argparse
-from datetime import datetime
-from pathlib import Path
 
-from qmla.config import ConfigError, load_config
+from qmla.cli import add_config_arguments, resolve_config, resolve_job_path
+from qmla.experiments import run_experiments
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
+    from pathlib import Path
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/default.toml", help="Path to project TOML configuration")
-    parser.add_argument("--model", choices=("qufex", "classical"), help="Override model.mode")
-    parser.add_argument("--device", help="Override training.device, e.g. cuda, cuda:0, or cpu")
-    parser.add_argument("--resume", type=Path, help="Resume from a latest.pt checkpoint")
-    parser.add_argument("--run-dir", type=Path, help="Explicit experiment output directory")
+    add_config_arguments(parser)
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--resume", type=Path, help="Format-2 latest.pt; use its resolved_config.toml")
     return parser
 
 
-def _resolve_override(path: Path, project_root: Path) -> Path:
-    return path.expanduser().resolve() if path.is_absolute() else (project_root / path).resolve()
-
-
-def main() -> None:
+def main():
     parser = build_parser()
     args = parser.parse_args()
     try:
-        config = load_config(args.config)
-        mode = args.model or config.model.mode
-        run_dir = (
-            _resolve_override(args.run_dir, config.paths.project_root)
-            if args.run_dir
-            else config.paths.runs_dir / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        from qmla.engine import Trainer
-
-        trainer = Trainer(config, run_dir, mode=mode, device_name=args.device)
-        if args.resume:
-            trainer.resume(_resolve_override(args.resume, config.paths.project_root))
-        best = trainer.run()
-        print(f"Best checkpoint: {best}")
-    except (ConfigError, OSError, ValueError) as exc:
+        config = resolve_config(args)
+        run_experiments(config, run_dir=resolve_job_path(args.run_dir, config), resume=resolve_job_path(args.resume, config))
+    except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 
 
 if __name__ == "__main__":
     main()
-
