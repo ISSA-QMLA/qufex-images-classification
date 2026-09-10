@@ -1,0 +1,130 @@
+# One source of truth. Profile tables merge; profile arrays REPLACE base arrays.
+[run]
+model = "qufex" # qufex | cnn_replacement | direct_cnn
+profile = "full64" # full64 | full128 | smoke | small_learning
+
+[paths]
+project_root = ".." # relative to this file; other paths relative to project_root
+raw_dir = "data/raw"
+processed_dir = "data/processed" # versioned caches live underneath
+runs_dir = "runs"
+checkpoints_dir = "checkpoints"
+results_dir = "results"
+
+[data]
+image_size = 64
+train_fraction = 0.70
+validation_fraction = 0.15
+test_fraction = 0.15
+seed = 42 # master split, independent of training seeds
+subset_seed = 42
+train_limit = 0 # zero means entire split
+validation_limit = 0
+test_limit = 0
+num_workers = 0 # portable; increase explicitly on the workstation
+preprocessing_batch_size = 256
+clean_label_policy = "hart_clean_flags"
+
+[architectures.shared]
+encoder_channels = [4, 8, 8, 8, 16]
+convolutions_per_block = 2
+kernel_size = 3 # positive odd kernels preserve spatial dimensions
+pooling = "max" # max | avg | none
+pool_size = 2
+normalization = "batch" # batch | group (one group) | none
+activation = "relu" # relu | gelu | silu | tanh | identity
+compression_channels = 16 # fixed QuFeX/replacement interface
+quantum_spatial_size = 2 # fixed QuFeX/replacement interface
+projection = "auto" # auto | conv | identity
+post_channels = [16] # [] removes post-extraction convolutions
+post_kernel_size = 3
+post_convolutions = 1
+classifier_hidden_neurons = [32] # [] gives a linear classifier
+dropout = 0.2
+
+[architectures.direct]
+# Generic convolution/head settings inherit from shared unless overridden here.
+encoder_channels = [16, 32, 64]
+convolutions_per_block = 1
+post_channels = []
+
+[architectures.replacement]
+hidden_channels = [8] # each filter is shared over QuFeX's channel groups
+kernel_size = 3
+output_kernel_size = 1
+activation = "relu"
+normalization = "none"
+output_activation = "identity"
+
+[quantum]
+backend = "default.qubit"
+diff_method = "backprop"
+shots = 0 # analytic simulation
+qubits = 8 # supported qubits/filters: 8/1, 4/1, 4/2
+filters = 1
+input_angle_scale = 3.141592653589793
+
+[training]
+device = "auto" # auto | cpu | cuda | cuda:N
+epochs = 50
+batch_size = 8
+optimizer = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0001
+early_stopping_patience = 8 # zero disables stopping
+amp = true # CUDA only; quantum execution is outside autocast
+class_weighting = true
+checkpoint_every = 1 # epoch interval; final state is always saved
+seeds = [42]
+deterministic = false
+cpu_threads = 4
+
+[evaluation]
+batch_size = 64
+save_predictions = true
+save_confusion_matrix = true
+class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
+
+[profiles.full64]
+
+[profiles.full128.data]
+image_size = 128
+[profiles.full128.architectures.shared]
+encoder_channels = [4, 8, 8, 8, 16, 16]
+
+[profiles.smoke.data]
+image_size = 32
+train_limit = 96
+validation_limit = 48
+test_limit = 48
+[profiles.smoke.architectures.shared]
+encoder_channels = [4, 4, 8, 16]
+convolutions_per_block = 1
+post_channels = [8]
+classifier_hidden_neurons = [8]
+[profiles.smoke.architectures.direct]
+encoder_channels = [4, 8]
+[profiles.smoke.training]
+epochs = 1
+batch_size = 8
+early_stopping_patience = 0
+[profiles.smoke.evaluation]
+batch_size = 8
+
+[profiles.small_learning.data]
+image_size = 32
+train_limit = 1200
+validation_limit = 300
+test_limit = 300
+[profiles.small_learning.architectures.shared]
+encoder_channels = [4, 4, 8, 16]
+convolutions_per_block = 1
+post_channels = [8]
+classifier_hidden_neurons = [8]
+[profiles.small_learning.architectures.direct]
+encoder_channels = [4, 8]
+[profiles.small_learning.training]
+epochs = 100
+early_stopping_patience = 10
+[profiles.small_learning.evaluation]
+batch_size = 8
