@@ -1,151 +1,147 @@
-# Quantum Machine Learning for Galaxy Morphology
+# Galaxy Zoo 2: QuFeX and classical CNN experiments
 
-This project compares a classical CNN with a hybrid CNN–QuFeX classifier on three clean Galaxy Zoo 2 morphology classes:
+Train and test three models on clean **smooth**, **unbarred spiral**, and **barred spiral** Galaxy Zoo 2 images. Every supported architecture and experiment preset is configured in **[`configs/experiments.toml`](configs/experiments.toml)**. Python 3.11+; Windows/Linux; CPU or one NVIDIA CUDA GPU.
 
-- smooth;
-- unbarred spiral;
-- barred spiral.
+## Start here
 
-The quantum module follows the eight-qubit, four-parameter QuFeX v1 circuit from Jain and Kalev, [arXiv:2501.13165v1](https://arxiv.org/html/2501.13165v1).
-
-## Architecture
-
-```text
-128x128 RGB image
-  -> configurable Conv/BatchNorm/ReLU/Pool encoder
-  -> 8x8x32 feature tensor (default)
-  -> 1x1 compression + adaptive pooling
-  -> 2x2x8 bottleneck
-  -> QuFeX residual (hybrid mode) or identity (classical mode)
-  -> configurable CNN -> global average pool -> MLP -> 3 logits
-```
-
-The `2x2x8` bottleneck is split into four `2x2x2` groups. Each group supplies eight angle-encoded values to the shared eight-qubit circuit. All batch/group inputs are broadcast through one QNode call.
-
-## Installation
-
-Python 3.11 or newer is required. 
-PyTorch is required but absent from `pyproject.toml` because its correct package depends on the current hardware:
-[PyTorch installation selector](https://pytorch.org/get-started/locally/). 
-
-To install this project:
+Use **uv** from the repository root on both Windows and Linux. Create a fresh environment on each machine; do not copy `.venv` between machines. The checked-in `.python-version` selects Python 3.11, and `uv.lock` pins the project dependencies.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-
-# Example only: choose the index/version matching the cluster CUDA stack.
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -e .
+uv sync --locked --group dev --inexact
 ```
 
-The project does not require torchvision. 
-Image preprocessing uses Pillow and training augmentation uses native Torch tensor operations.
+This creates `.venv` and installs the project and development tools. `--inexact` preserves an existing machine-specific PyTorch installation. No environment activation is needed for the commands below.
 
-For development tests:
+On a fresh environment, install **one** PyTorch build:
 
 ```bash
-python -m pip install -e .
-python -m pip install pytest
-pytest
+# CPU-only environment
+uv pip install torch --torch-backend=cpu
+
+# Alternatively, select a backend from the detected NVIDIA driver
+uv pip install torch --torch-backend=auto
 ```
 
-With `uv`, run `uv sync --group dev` first and install the cluster-specific PyTorch wheel afterward with `uv pip install ...`. A later exact `uv sync` may remove packages that are intentionally absent from the lockfile; use `uv sync --inexact` when preserving that custom Torch installation.
+On a cluster login node without the target GPU/driver, select the backend explicitly according to your site's stack, for example `uv pip install torch --torch-backend=cu128` for a compatible CUDA 12.8 setup. See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection). Torch remains machine-specific and outside `uv.lock`; no torchvision is required. Each run records its installed Torch version.
 
-## Configuration
+The examples use `uv run --no-sync` to execute the already-prepared environment without synchronizing it during a run. After dependency changes, repeat `uv sync --locked --group dev --inexact`; if the lockfile is stale, update it deliberately with `uv lock` first. See [uv's syncing behavior](https://docs.astral.sh/uv/concepts/projects/sync/). An exact `uv sync` can remove manually installed Torch because it is absent from the project dependency list.
 
-All stable settings live in [`configs/default.toml`](configs/default.toml). Copy that file for each experiment and change paths, encoder depth/channels, dense hidden neurons, optimizer settings, or backend without editing Python code.
-
-Relative data/output paths are resolved from `paths.project_root`, which is itself resolved relative to the TOML file. Each run stores both the source TOML and a fully resolved JSON configuration.
-
-Important constraints for source-faithful QuFeX are validated:
-
-- `model.compression_channels = 8`;
-- `model.quantum_spatial_size = 2`;
-- `quantum.qubits = 8`.
-
-CLI values take precedence over TOML only for job-specific settings such as `--device`, `--model`, `--resume`, `--checkpoint`, and `--run-dir`.
-
-## Pipeline
-
-Run every command from an installed environment. `python -m ...` also works consistently from the repository root.
-
-### 1. Download and extract
+Download the official image archive and catalogues once:
 
 ```bash
-python -m scripts.extract_data --config configs/default.toml
+uv run --no-sync python -m scripts.extract_data
 ```
 
-This downloads the official 3.4 GB Zenodo image archive and mapping plus the Hart et al. debiased catalogue. Downloads are resumable, known Zenodo MD5 checksums are verified, extraction rejects unsafe ZIP paths, and SHA-256 hashes are recorded.
-
-### 2. Preprocess
+Then run a real-image smoke experiment:
 
 ```bash
-python -m scripts.preprocess_data --config configs/default.toml
+uv run --no-sync python -m scripts.train --profile smoke --device cpu
 ```
 
-Labels use the Hart/Willett clean flags:
+This prepares a separate tiny dataset cache, trains the **one model selected by `[run].model`**, and evaluates its best checkpoint. Downloads are explicit: training never starts a download automatically. Existing raw images can be reused. A first run also indexes the image archive and reads the catalogues, so preparation time is separate from training time.
 
-- smooth flag;
-- spiral flag and no-bar flag;
-- spiral flag and bar flag.
+## One TOML controls all experiments
 
-Ambiguous/conflicting rows are dropped. Object IDs are deduplicated before a fixed stratified 70/15/15 split. Images and labels are saved as memory-mapped `.npy` arrays. Normalization statistics are computed from the training split only.
+Select defaults at the top of `configs/experiments.toml`:
 
-### 3. Train both single-run prototypes
+```toml
+[run]
+model = "qufex" # qufex | cnn_replacement | direct_cnn
+profile = "smoke" # full64 | full128 | smoke | small_learning
+```
+
+| Profile | Image size | Train / validation / test images | Epochs |
+|---|---:|---|---:|
+| `full64` | 64×64 | All clean master-split images | Up to 50 |
+| `full128` | 128×128 | All clean master-split images | Up to 50 |
+| `smoke` | 32×32 | 96 / 48 / 48 | 1 |
+| `small_learning` | 32×32 | 1,200 / 300 / 300 | 3 |
+
+Precedence is **base tables → selected profile → explicit job-level CLI overrides**. Nested tables merge recursively; arrays replace entirely. Zero subset limits select the whole split. Limits larger than a split use all available images. Invalid and unknown settings fail before model allocation.
+
+Architecture tables:
+
+- `[architectures.shared]`: encoder channels/depth, convolutions per block, odd kernel sizes, max/average/no pooling, pooling size, batch/group/no normalization, activation, bottleneck projection, post-extraction convolutions, classifier widths, and dropout for QuFeX and its CNN replacement.
+- `[architectures.direct]`: independent direct-CNN encoder; unspecified generic block/head settings inherit from `shared`. It does not inherit the hybrid encoder widths, projection, bottleneck dimensions, or post-layer widths. Direct CNN never uses the quantum bottleneck.
+- `[architectures.replacement]`: hidden channels, hidden/output kernel sizes, normalization, hidden/output activation. Each filter's final channel count is inferred from its input group.
+- `[quantum]`: `qubits`, `filters`, angle scale, backend, differentiation method, and shots. Supported published circuit families are **8/1, 4/1, 4/2**. Circuit gate connectivity is defined in Python.
+- `[profiles.NAME.architectures.shared]` and corresponding `direct`/`replacement` tables: architecture changes specific to a preset, in the same file.
+
+For example, edit these existing smoke-profile tables to change complexity:
+
+```toml
+[profiles.smoke.architectures.shared]
+encoder_channels = [4, 8, 16]
+convolutions_per_block = 1
+post_channels = []
+classifier_hidden_neurons = [8]
+
+[profiles.smoke.architectures.replacement]
+hidden_channels = [4, 4]
+```
+
+Connecting dimensions are inferred. Kernels use same-size padding. `projection="auto"` inserts a 1×1 projection when needed, `conv` always inserts it, and `identity` requires matching channels. An adaptive pool produces the required **16×2×2** hybrid interface; the encoder must retain at least 2×2 spatial dimensions. These interface constraints do not apply to the direct CNN. Hidden classifier/post-layer arrays may be empty. Group normalization uses one group per sample.
+
+The quantum layer and its CNN control group adjacent feature-map pairs for 8/1, or individual maps for four-qubit variants. Filters share weights across groups. With two filters, both outputs and residuals interleave per input channel. The direct CNN provides a broader conventional baseline; it is not a strict layer ablation or parameter-matched model.
+
+## Training, comparison, and testing
 
 ```bash
-python -m scripts.train --config configs/default.toml --model classical
-python -m scripts.train --config configs/default.toml --model qufex
+# TOML-selected model; prepares its cache if missing, then trains and tests
+uv run --no-sync python -m scripts.train
+uv run --no-sync python -m scripts.train --profile full128 --model cnn_replacement
+uv run --no-sync python -m scripts.train --profile small_learning --model direct_cnn --device cpu
+
+# All three model families, sequentially, for the configured quantum variant
+uv run --no-sync python -m scripts.benchmark --profile full64
+
+# Prepare data separately before reserving a GPU
+uv run --no-sync python -m scripts.preprocess_data --profile full64
+
+# Evaluate using the checkpoint's saved architecture/configuration
+uv run --no-sync python -m scripts.test_model --checkpoint checkpoints/RUN_NAME/best.pt --device cpu
 ```
 
-Resume a preempted job:
+`training.seeds = [42]` makes a preliminary single-seed comparison; use e.g. `[42, 43, 44]` for repeated training on the same master split. Each model receives identical split/subset identities, augmentation policy, normalization, optimizer settings, and seed list. Quantum variants are selected explicitly in TOML; benchmarking does not automatically sweep them.
+
+Full profiles stop after eight epochs without validation macro-F1 improvement, with a 50-epoch ceiling. Smaller profiles disable early stopping. The held-out test split is evaluated after selecting the best validation checkpoint. `training.device="auto"` selects available CUDA, otherwise CPU. Explicit CUDA requests fail if unavailable; OOM errors never silently change the experiment. AMP/TF32 acceleration applies on CUDA; quantum execution is outside autocast. Set `training.deterministic=true` for deterministic supported kernels.
+
+The default analytic `default.qubit`/`backprop` combination supports CPU and CUDA. Other PennyLane backends require their own compatible installation and differentiation method; changing the backend alone does not guarantee acceleration. Finite shots cannot use backprop. The software validates known incompatible combinations and otherwise reports backend errors.
+
+## Data integrity and portability
+
+Objects are deduplicated before the fixed stratified 70/15/15 master split. Small subsets are chosen within each split, retain all classes, and approximate original proportions. Normalization is computed only on the selected training images.
+
+Caches are stored under `processed_dir/gz2-SIZE-SIGNATURE`. Their metadata records configuration, source hashes, master/subset identities, array/manifest hashes, and normalization. Training/evaluation check integrity, dimensions, labels, and split disjointness. This includes reading the processed files for hashing; large caches have an up-front I/O cost. Existing loose 128×128 arrays are preserved and never silently reused as 64×64 or 32×32 data. Failed preprocessing builds remain in isolated `.building-*` directories for inspection. If source data change or a cache is damaged, select a new `processed_dir` to rebuild without overwriting the old cache.
+
+Keep runs and checkpoints on persistent storage. You may place processed caches on local scratch and copy complete cache directories between hosts. All commands accept `--project-root`, `--raw-dir`, `--processed-dir`, `--runs-dir`, `--checkpoints-dir`, and `--results-dir`. Relative data paths in canonical TOML resolve from `project_root`, itself relative to the TOML location. Saved effective configurations use absolute paths. Overriding `--project-root` relocates saved paths beneath the previous project root, including Windows-to-Linux transfers; paths on external volumes need their own override. Pass an absolute new project root when relocating a saved run.
+
+Resume at the last saved epoch boundary:
 
 ```bash
-python -m scripts.train \
-  --config runs/qufex_YYYYMMDD_HHMMSS/resolved_config.toml \
-  --model qufex \
-  --resume checkpoints/qufex_YYYYMMDD_HHMMSS/latest.pt \
-  --run-dir runs/qufex_YYYYMMDD_HHMMSS
+uv run --no-sync python -m scripts.train --config runs/RUN_NAME/resolved_config.toml \
+  --resume checkpoints/RUN_NAME/latest.pt --run-dir runs/RUN_NAME
 ```
 
-The primary validation criterion is macro-F1. Training uses class-weighted cross-entropy, AMP for the CNN, float32 for QuFeX, TF32 where available, pinned data loading, non-blocking CUDA copies, and channels-last convolution tensors.
+`latest.pt` stores model, optimizer, AMP scaler, Python/NumPy/Torch RNGs, loader generators, history, and the best model so far. Workers are recreated with reproducible seeds each epoch, and spawned workers reopen memory maps instead of copying arrays. Mid-epoch progress is not saved. CPU/CUDA relocation is supported; exact equality across devices or changed worker counts is not promised. `best.pt` is for evaluation, not resume. Format-1 checkpoints and former configuration files are intentionally unsupported; existing run artifacts remain untouched.
 
-### 4. Test and save results
+## Notebook and SLURM
+
+Use [`notebooks/02-configurable-experiments.ipynb`](notebooks/02-configurable-experiments.ipynb) for the same resolver and run APIs with result plots. Select the uv-created `.venv` Python interpreter as the notebook kernel in your editor; `ipykernel` is installed by `uv sync`. The older exploratory notebook is preserved. Model graph rendering is not required.
+
+Copy/edit the site placeholders in [`scripts/slurm/cpu.sbatch.example`](scripts/slurm/cpu.sbatch.example) and [`scripts/slurm/gpu.sbatch.example`](scripts/slurm/gpu.sbatch.example). They are templates, not measured hardware requirements. Set your account, partition, environment/modules, memory and time allocation. Prepare the uv environment, install the appropriate Torch build, and prepare/download data before the training allocation. Make `uv` available on the job's `PATH`; the templates use `uv run --no-sync` so jobs do not resolve or install dependencies. Each job uses one CPU process or one GPU; requesting multiple GPUs does not accelerate this trainer.
+
+## Outputs and verification
+
+Each run saves effective/source TOML, JSON configuration and CLI overrides, package versions, dataset provenance, per-epoch metrics, and runtime/hardware information. Checkpoints live under `checkpoints_dir/RUN_NAME`; test reports, predictions and confusion matrices live under `results_dir/RUN_NAME`. Comparison rows include all artifact paths. The run root contains `comparison.csv/json` and `summary.csv/json`; single-seed summaries report no estimated standard deviation. Existing completed outputs are protected against accidental reuse. Each invocation saves job metadata, including resume and CLI overrides.
+
+Runtime includes training, validation, and checkpoint writes for the current invocation. Training throughput divides processed training samples by that duration. Evaluation runtime includes report generation. RSS is sampled every 50 ms and includes loader workers (shared pages may be counted multiple times); GPU figures are PyTorch allocator peaks. Treat these as measured process usage, not an estimate of the whole machine or other processes. Resume timing describes the resumed invocation, while history retains all epochs.
 
 ```bash
-python -m scripts.test_model \
-  --config runs/qufex_YYYYMMDD_HHMMSS/resolved_config.toml \
-  --checkpoint checkpoints/qufex_YYYYMMDD_HHMMSS/best.pt
+uv sync --locked --group dev --inexact
+uv run --no-sync python -m pytest -q
 ```
 
-Outputs include `metrics.json`, `classification_report.txt`, `predictions.csv`, `confusion_matrix.png`, resolved/source configuration, and package versions.
+Tests cover configuration/profiles, all model variants and gradients, grouped residuals, cache integrity, stratification, deterministic CPU resume including a spawned worker, single-model smoke, paired benchmarks, and CUDA when available. The [real-image pilot report](docs/smoke-pilot.md) records successful CPU/CUDA smoke runs on this laptop. Tiny smoke accuracy is a pipeline check; robust research conclusions need repeated seeds and appropriate controls.
 
-## SLURM examples
-
-Cluster module names, partitions, accounts, and wall-time policies differ, so this repository keeps scheduler settings out of fixed `.sbatch` files.
-
-CPU download/preprocessing job:
-
-```bash
-sbatch --job-name=gz2-prep --cpus-per-task=16 --mem=64G --time=08:00:00 \
-  --wrap='source .venv/bin/activate && python -m scripts.preprocess_data --config configs/default.toml'
-```
-
-Single-NVIDIA-GPU training job:
-
-```bash
-sbatch --job-name=qufex --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=24:00:00 \
-  --wrap='source .venv/bin/activate && python -m scripts.train --config configs/default.toml --model qufex'
-```
-
-If the eight-qubit simulation is slower on GPU, set both `training.device = "cpu"` and `quantum.backend = "lightning.qubit"` for a CPU comparison. `lightning.gpu` additionally requires the cluster-compatible PennyLane Lightning GPU/cuQuantum installation and usually benefits larger circuits more than this eight-wire model.
-
-## Research limitations
-
-- The clean flags select high-confidence morphological extremes and exclude many ambiguous galaxies.
-- A single split and seed are suitable for plumbing and preliminary comparison only.
-- The classical bypass is an ablation, not a compute-matched proof that any improvement is specifically quantum.
-- Strong conclusions require repeated seeds/splits and stronger classical bottleneck controls.
-
-Please cite the [Galaxy Zoo 2 data release](https://academic.oup.com/mnras/article/435/4/2835/1022913), the [Hart et al. debiasing work](https://academic.oup.com/mnras/article/461/4/3663/2608720), the [Zenodo image release](https://zenodo.org/records/3565489), and the QuFeX paper when using this project.
+The quantum circuit follows [QuFeX v1](https://arxiv.org/html/2501.13165v1). Data sources: [Galaxy Zoo 2](https://academic.oup.com/mnras/article/435/4/2835/1022913), [Hart et al.](https://academic.oup.com/mnras/article/461/4/3663/2608720), and the [Zenodo image release](https://zenodo.org/records/3565489).

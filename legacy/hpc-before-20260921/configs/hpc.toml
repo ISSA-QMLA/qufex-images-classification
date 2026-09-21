@@ -1,0 +1,54 @@
+[paths]
+# project_root is resolved relative to this file, not the shell working directory.
+project_root = ".."
+raw_dir = "/data/qmla/famato/data/raw"
+processed_dir = "/data/qmla/famato/data/processed"
+runs_dir = "/data/qmla/famato/runs"
+checkpoints_dir = "/data/qmla/famato/checkpoints"
+results_dir = "/data/qmla/famato/results"
+
+[data]
+image_size = 128
+train_fraction = 0.70
+validation_fraction = 0.15
+test_fraction = 0.15
+seed = 42
+num_workers = 2
+preprocessing_batch_size = 256
+clean_label_policy = "hart_clean_flags"
+
+[model]
+mode = "classical"
+encoder_channels = [16, 32, 64, 32]
+convolutions_per_block = 1
+compression_channels = 8
+quantum_spatial_size = 2
+post_quantum_channels = [16]
+classifier_hidden_neurons = [32]
+dropout = 0.20
+
+[quantum]
+backend = "lightning.qubit"
+diff_method = "adjoint"
+shots = 0
+qubits = 8
+input_angle_scale = 3.141592653589793
+
+[training]
+device = "cuda"
+epochs = 100 
+batch_size = 4
+optimizer = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0001
+early_stopping_patience = 2
+amp = true
+class_weighting = true
+checkpoint_every = 2
+
+[evaluation]
+batch_size = 128
+save_predictions = true
+save_confusion_matrix = true
+class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
+

@@ -34,23 +34,32 @@ def seed_everything(seed: int) -> None:
 
 def resolve_device(requested: str) -> Any:
     torch = require_torch()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(requested)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA was requested but is unavailable. Load the cluster CUDA modules and install a matching "
             "PyTorch build, or set training.device='cpu'."
         )
+    if device.type == "cuda" and device.index is not None and device.index >= torch.cuda.device_count():
+        raise RuntimeError(f"Requested GPU {device.index}, but only {torch.cuda.device_count()} CUDA devices are available")
     return device
 
 
-def configure_accelerator(device: Any) -> None:
+def configure_accelerator(device: Any, *, deterministic: bool = False, cpu_threads: int = 4) -> None:
     torch = require_torch()
+    torch.set_num_threads(cpu_threads)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(deterministic)
+    torch.backends.cudnn.deterministic = deterministic
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+        torch.backends.cudnn.allow_tf32 = not deterministic
         try:
-            torch.set_float32_matmul_precision("high")
+            torch.set_float32_matmul_precision("highest" if deterministic else "high")
         except AttributeError:
             pass
 
@@ -80,4 +89,3 @@ def write_package_versions(directory: Path) -> Path:
     destination = directory / "package_versions.json"
     destination.write_text(json.dumps(package_versions(), indent=2), encoding="utf-8")
     return destination
-

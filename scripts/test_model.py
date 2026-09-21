@@ -1,44 +1,36 @@
-"""Evaluate a trained checkpoint and save reproducible result artifacts."""
-
-from __future__ import annotations
-
+"""Evaluate a versioned checkpoint using its saved architecture by default."""
 import argparse
 from datetime import datetime
 from pathlib import Path
 
-from qmla.config import ConfigError, load_config
+from qmla.cli import add_config_arguments, path_overrides, resolve_config, resolve_job_path
+from qmla.engine import Evaluator, load_checkpoint_config
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/default.toml", help="Training-compatible TOML configuration")
-    parser.add_argument("--checkpoint", required=True, type=Path, help="Path to best.pt or latest.pt")
-    parser.add_argument("--device", help="Override training.device")
-    parser.add_argument("--run-dir", type=Path, help="Explicit results output directory")
+    add_config_arguments(parser, checkpoint_defaults=True)
+    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--run-dir", type=Path)
     return parser
 
 
-def _resolve_override(path: Path, project_root: Path) -> Path:
-    return path.expanduser().resolve() if path.is_absolute() else (project_root / path).resolve()
-
-
-def main() -> None:
+def main():
     parser = build_parser()
     args = parser.parse_args()
     try:
-        config = load_config(args.config)
-        checkpoint = _resolve_override(args.checkpoint, config.paths.project_root)
-        output_dir = (
-            _resolve_override(args.run_dir, config.paths.project_root)
-            if args.run_dir
-            else config.paths.results_dir
-            / f"{checkpoint.parent.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        from qmla.engine import Evaluator
-
-        Evaluator(config, checkpoint, output_dir, device_name=args.device).run()
-        print(f"Results saved to: {output_dir}")
-    except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+        if args.config:
+            config = resolve_config(args)
+            checkpoint = resolve_job_path(args.checkpoint, config)
+        else:
+            if args.profile or args.model:
+                parser.error("--profile/--model require --config; otherwise checkpoint settings are used")
+            checkpoint = args.checkpoint.resolve()
+            config = load_checkpoint_config(checkpoint, device=args.device, paths=path_overrides(args))
+        output = resolve_job_path(args.run_dir, config) or config.paths.results_dir / f"{checkpoint.parent.name}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        Evaluator(config, checkpoint, output).run()
+        print(f"Results: {output}")
+    except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 
 

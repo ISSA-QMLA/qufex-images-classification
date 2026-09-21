@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import asdict
 
 try:
-    import pennylane as qml
     import torch
     from torch import nn
 except ImportError as exc:  # pragma: no cover - depends on machine-specific PyTorch
@@ -13,27 +13,42 @@ except ImportError as exc:  # pragma: no cover - depends on machine-specific PyT
         "qmla.model requires PyTorch. Install the CUDA/CPU build appropriate for this machine."
     ) from exc
 
-from qmla.config import AppConfig
+from qmla.config import AppConfig, ReplacementConfig
+
+
+def activation(name: str) -> nn.Module:
+    return {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU,
+            "tanh": nn.Tanh, "identity": nn.Identity}[name]()
+
+
+def normalization(name: str, channels: int) -> nn.Module:
+    if name == "batch":
+        return nn.BatchNorm2d(channels)
+    if name == "group":
+        return nn.GroupNorm(1, channels)
+    return nn.Identity()
 
 
 class ConvBlock(nn.Module):
     """Repeated Conv-BatchNorm-ReLU operations with optional max pooling."""
 
-    def __init__(self, in_channels: int, out_channels: int, repetitions: int, *, pool: bool) -> None:
+    def __init__(self, in_channels: int, out_channels: int, repetitions: int, *,
+                 pool: str = "none", pool_size: int = 2, kernel_size: int = 3,
+                 norm: str = "batch", act: str = "relu") -> None:
         super().__init__()
         layers: list[nn.Module] = []
         current = in_channels
         for _ in range(repetitions):
             layers.extend(
                 [
-                    nn.Conv2d(current, out_channels, kernel_size=3, padding=1, bias=False),
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(inplace=True),
+                    nn.Conv2d(current, out_channels, kernel_size=kernel_size, padding=kernel_size // 2, bias=norm == "none"),
+                    normalization(norm, out_channels),
+                    activation(act),
                 ]
             )
             current = out_channels
-        if pool:
-            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        if pool != "none":
+            layers.append((nn.MaxPool2d if pool == "max" else nn.AvgPool2d)(pool_size))
         self.block = nn.Sequential(*layers)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -41,11 +56,7 @@ class ConvBlock(nn.Module):
 
 
 class QuFeXLayer(nn.Module):
-    """Eight-qubit QuFeX v1 circuit operating on four 2x2x2 channel groups.
-
-    Circuit and output ordering follow Jain and Kalev, arXiv:2501.13165v1,
-    and the authors' Qu-Net reference implementation.
-    """
+    """Published 8(1), 4(1), or 4(2) QuFeX over a [B, 16, 2, 2] bottleneck."""
 
     def __init__(
         self,
@@ -53,20 +64,44 @@ class QuFeXLayer(nn.Module):
         backend: str = "default.qubit",
         diff_method: str = "backprop",
         shots: int = 0,
+        qubits: int = 8,
+        filters: int = 1,
         input_angle_scale: float = torch.pi,
     ) -> None:
         super().__init__()
-        self.qubits = 8
+        if (qubits, filters) not in {(8, 1), (4, 1), (4, 2)}:
+            raise ValueError("QuFeXLayer supports qubits/filters 8/1, 4/1, or 4/2")
+        self.qubits = qubits
+        self.filters = filters
+        self.output_channels = 32 if filters == 2 else 16
         self.input_angle_scale = float(input_angle_scale)
-        self.theta = nn.Parameter(torch.empty(4, dtype=torch.float32))
+        self.theta = nn.Parameter(torch.empty(filters, 4, dtype=torch.float32))
         nn.init.uniform_(self.theta, -0.1, 0.1)
+        self._circuits = tuple(
+            self._make_circuit(
+                backend=backend,
+                diff_method=diff_method,
+                shots=shots,
+                second_filter=index == 1,
+            )
+            for index in range(filters)
+        )
+
+    def _make_circuit(
+        self,
+        *,
+        backend: str,
+        diff_method: str,
+        shots: int,
+        second_filter: bool,
+    ) -> Any:
+        import pennylane as qml
+
         device = qml.device(backend, wires=self.qubits, shots=None if shots == 0 else shots)
 
         @qml.qnode(device, interface="torch", diff_method=diff_method)
         def circuit(inputs: torch.Tensor, theta: torch.Tensor) -> Any:
-            # Make the simulator's initial state follow the Torch input device.
-            # Without this, default.qubit can create its implicit |0...0> state
-            # on CPU before applying a broadcasted CUDA AngleEmbedding.
+            # Keep the simulator's initial state on the Torch input device.
             initial_state = torch.zeros(
                 2**self.qubits,
                 dtype=inputs.dtype,
@@ -74,109 +109,186 @@ class QuFeXLayer(nn.Module):
             )
             initial_state[0] = 1.0
             qml.StatePrep(initial_state, wires=range(self.qubits))
-            qml.AngleEmbedding(
-                inputs * self.input_angle_scale,
-                wires=range(self.qubits),
-                rotation="Y",
-            )
 
-            # U1: nearest-neighbour, translationally shared convolution gates.
-            for first, second in ((0, 1), (2, 3), (4, 5), (6, 7), (1, 2), (3, 4), (5, 6)):
-                qml.RX(theta[0], wires=first)
-                qml.RZ(theta[1], wires=second)
-                qml.CNOT(wires=(first, second))
-
-            # V1: pooling gates; QuFeX retains rather than discards control qubits.
-            for first, second in ((0, 1), (2, 3), (4, 5), (6, 7)):
-                qml.CZ(wires=(first, second))
-
-            # U2 and V2 operate at the next hierarchical scale.
-            for first, second in ((0, 2), (4, 6), (2, 4)):
-                qml.RX(theta[2], wires=first)
-                qml.RY(theta[3], wires=second)
-                qml.CNOT(wires=(first, second))
-            for first, second in ((0, 2), (4, 6)):
-                qml.CZ(wires=(first, second))
+            if second_filter:
+                for wire in range(self.qubits):
+                    qml.Hadamard(wires=wire)
+                qml.AngleEmbedding(
+                    inputs * self.input_angle_scale,
+                    wires=range(self.qubits),
+                    rotation="Z",
+                )
+                first_pairs = ((0, 1), (2, 3), (1, 2))
+                for first, second in first_pairs:
+                    qml.RY(theta[0], wires=first)
+                    qml.RX(theta[1], wires=second)
+                    qml.CNOT(wires=(first, second))
+                for first, second in ((0, 1), (2, 3)):
+                    qml.CZ(wires=(first, second))
+                qml.RZ(theta[2], wires=0)
+                qml.RX(theta[3], wires=2)
+                qml.CNOT(wires=(0, 2))
+                qml.CZ(wires=(0, 2))
+            else:
+                qml.AngleEmbedding(
+                    inputs * self.input_angle_scale,
+                    wires=range(self.qubits),
+                    rotation="Y",
+                )
+                first_pairs = (
+                    ((0, 1), (2, 3), (4, 5), (6, 7), (1, 2), (3, 4), (5, 6))
+                    if self.qubits == 8
+                    else ((0, 1), (2, 3), (1, 2))
+                )
+                for first, second in first_pairs:
+                    qml.RX(theta[0], wires=first)
+                    qml.RZ(theta[1], wires=second)
+                    qml.CNOT(wires=(first, second))
+                pooling_pairs = (
+                    ((0, 1), (2, 3), (4, 5), (6, 7))
+                    if self.qubits == 8
+                    else ((0, 1), (2, 3))
+                )
+                for first, second in pooling_pairs:
+                    qml.CZ(wires=(first, second))
+                second_pairs = ((0, 2), (4, 6), (2, 4)) if self.qubits == 8 else ((0, 2),)
+                for first, second in second_pairs:
+                    qml.RX(theta[2], wires=first)
+                    qml.RY(theta[3], wires=second)
+                    qml.CNOT(wires=(first, second))
+                final_pairs = ((0, 2), (4, 6)) if self.qubits == 8 else ((0, 2),)
+                for first, second in final_pairs:
+                    qml.CZ(wires=(first, second))
 
             return tuple(qml.expval(qml.PauliZ(wire)) for wire in range(self.qubits))
 
-        self._circuit = circuit
+        return circuit
 
     @property
     def quantum_parameter_count(self) -> int:
         return self.theta.numel()
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if inputs.ndim != 4 or tuple(inputs.shape[1:]) != (8, 2, 2):
-            raise ValueError(f"QuFeXLayer expects [batch, 8, 2, 2], received {tuple(inputs.shape)}")
-        batch = inputs.shape[0]
-
-        # NCHW -> four groups of NHWC 2x2x2 values. Flattening in this order
-        # reproduces TensorFlow/Keras Flatten from the cited reference code.
-        grouped = inputs.reshape(batch, 4, 2, 2, 2).permute(0, 1, 3, 4, 2)
-        circuit_inputs = grouped.reshape(batch * 4, 8)
-        outputs = self._circuit(circuit_inputs, self.theta)
+    @staticmethod
+    def _stack_measurements(outputs: Any, inputs: torch.Tensor) -> torch.Tensor:
         if isinstance(outputs, (tuple, list)):
             outputs = torch.stack(tuple(outputs), dim=-1)
-        elif outputs.ndim == 2 and outputs.shape[0] == 8 and outputs.shape[1] != 8:
-            outputs = outputs.transpose(0, 1)
-        outputs = outputs.to(dtype=inputs.dtype)
+        return outputs.to(dtype=inputs.dtype)
 
-        # Interleaved even/odd qubit outputs become the two channels in each map.
-        maps = outputs.reshape(batch, 4, 2, 2, 2).permute(0, 1, 4, 2, 3)
-        return maps.reshape(batch, 8, 2, 2)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim != 4 or tuple(inputs.shape[1:]) != (16, 2, 2):
+            raise ValueError(f"QuFeXLayer expects [batch, 16, 2, 2], received {tuple(inputs.shape)}")
+        batch = inputs.shape[0]
+        if self.qubits == 8:
+            # tf.split(..., axis=-1) into adjacent channel pairs + Keras Flatten.
+            grouped = inputs.reshape(batch, 8, 2, 2, 2).permute(0, 1, 3, 4, 2)
+            circuit_inputs = grouped.reshape(batch * 8, 8)
+            outputs = self._stack_measurements(
+                self._circuits[0](circuit_inputs, self.theta[0]),
+                inputs,
+            )
+            # Gather even/odd measurements into the two output maps per group.
+            maps = outputs.reshape(batch, 8, 2, 2, 2).permute(0, 1, 4, 2, 3)
+            return maps.reshape(batch, 16, 2, 2)
+
+        # Four-qubit notebooks apply the same filter(s) to each individual map.
+        circuit_inputs = inputs.reshape(batch * 16, 4)
+        filter_maps = []
+        for index, circuit in enumerate(self._circuits):
+            outputs = self._stack_measurements(circuit(circuit_inputs, self.theta[index]), inputs)
+            filter_maps.append(outputs.reshape(batch, 16, 2, 2))
+        if self.filters == 1:
+            return filter_maps[0]
+        # Match per-input-map concatenation: c0/f0, c0/f1, c1/f0, c1/f1, ...
+        return torch.stack(filter_maps, dim=2).reshape(batch, 32, 2, 2)
+
+
+class CNNReplacement(nn.Module):
+    """Independent filters shared over exactly the same groups as QuFeX."""
+
+    def __init__(self, config: ReplacementConfig, qubits: int, filters: int):
+        super().__init__()
+        self.group_channels = 2 if qubits == 8 else 1
+        self.filters = filters
+        self.output_channels = 16 * filters
+        networks = []
+        for _ in range(filters):
+            layers = []
+            current = self.group_channels
+            for channels in config.hidden_channels:
+                layers.append(ConvBlock(current, channels, 1, kernel_size=config.kernel_size,
+                                        norm=config.normalization, act=config.activation))
+                current = channels
+            layers.extend([nn.Conv2d(current, self.group_channels, config.output_kernel_size,
+                                     padding=config.output_kernel_size // 2), activation(config.output_activation)])
+            networks.append(nn.Sequential(*layers))
+        self.networks = nn.ModuleList(networks)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if tuple(inputs.shape[1:]) != (16, 2, 2):
+            raise ValueError("CNN replacement requires [batch, 16, 2, 2]")
+        batch = inputs.shape[0]
+        grouped = inputs.reshape(-1, self.group_channels, 2, 2)
+        outputs = [network(grouped).reshape(batch, 16, 2, 2) for network in self.networks]
+        return outputs[0] if self.filters == 1 else torch.stack(outputs, dim=2).reshape(batch, 32, 2, 2)
+
+
+def residual_for_filters(features: torch.Tensor, filters: int) -> torch.Tensor:
+    return features.repeat_interleave(filters, dim=1) if filters > 1 else features
 
 
 class GalaxyClassifier(nn.Module):
-    """CNN encoder -> optional QuFeX residual -> CNN/MLP classifier."""
+    """Configurable QuFeX, grouped CNN replacement, or direct CNN."""
 
     def __init__(self, config: AppConfig, *, mode: str | None = None) -> None:
         super().__init__()
-        self.mode = mode or config.model.mode
-        if self.mode not in {"qufex", "classical"}:
-            raise ValueError("mode must be 'qufex' or 'classical'")
+        config = config.for_model(mode or config.run.model)
+        self.mode = config.run.model
+        arch = config.architecture
 
         encoder: list[nn.Module] = []
         current_channels = 3
-        for channels in config.model.encoder_channels:
+        for channels in arch.encoder_channels:
             encoder.append(
                 ConvBlock(
                     current_channels,
                     channels,
-                    config.model.convolutions_per_block,
-                    pool=True,
+                    arch.convolutions_per_block,
+                    pool=arch.pooling, pool_size=arch.pool_size, kernel_size=arch.kernel_size,
+                    norm=arch.normalization, act=arch.activation,
                 )
             )
             current_channels = channels
         self.encoder = nn.Sequential(*encoder)
-        self.compression = nn.Sequential(
-            nn.Conv2d(current_channels, config.model.compression_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(config.model.compression_channels),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((config.model.quantum_spatial_size,) * 2),
-        )
+        bottleneck: list[nn.Module] = []
+        if self.mode != "direct_cnn":
+            if arch.projection == "conv" or current_channels != arch.compression_channels:
+                bottleneck.append(ConvBlock(current_channels, arch.compression_channels, 1,
+                                             kernel_size=1, norm=arch.normalization, act=arch.activation))
+            bottleneck.append(nn.AdaptiveAvgPool2d(arch.quantum_spatial_size))
+            current_channels = arch.compression_channels
+        self.compression = nn.Sequential(*bottleneck)
 
         self.qufex: QuFeXLayer | None = None
+        self.replacement: CNNReplacement | None = None
         if self.mode == "qufex":
-            self.qufex = QuFeXLayer(
-                backend=config.quantum.backend,
-                diff_method=config.quantum.diff_method,
-                shots=config.quantum.shots,
-                input_angle_scale=config.quantum.input_angle_scale,
-            )
+            self.qufex = QuFeXLayer(**asdict(config.quantum))
+        elif self.mode == "cnn_replacement":
+            self.replacement = CNNReplacement(config.architectures.replacement, config.quantum.qubits, config.quantum.filters)
+        self.filters = config.quantum.filters if self.mode != "direct_cnn" else 1
 
         post_layers: list[nn.Module] = []
-        current_channels = config.model.compression_channels
-        for channels in config.model.post_quantum_channels:
-            post_layers.append(ConvBlock(current_channels, channels, 1, pool=False))
+        current_channels *= self.filters
+        for channels in arch.post_channels:
+            post_layers.append(ConvBlock(current_channels, channels, arch.post_convolutions,
+                                         kernel_size=arch.post_kernel_size, norm=arch.normalization, act=arch.activation))
             current_channels = channels
         self.post_quantum = nn.Sequential(*post_layers)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
         head: list[nn.Module] = []
         current_features = current_channels
-        for hidden in config.model.classifier_hidden_neurons:
-            head.extend([nn.Linear(current_features, hidden), nn.ReLU(inplace=True), nn.Dropout(config.model.dropout)])
+        for hidden in arch.classifier_hidden_neurons:
+            head.extend([nn.Linear(current_features, hidden), activation(arch.activation), nn.Dropout(arch.dropout)])
             current_features = hidden
         head.append(nn.Linear(current_features, len(config.evaluation.class_names)))
         self.classifier = nn.Sequential(*head)
@@ -191,7 +303,10 @@ class GalaxyClassifier(nn.Module):
             # Quantum simulation remains float32 even when surrounding CNNs use AMP.
             with torch.autocast(device_type=features.device.type, enabled=False):
                 quantum_features = self.qufex(features.float())
-            features = features + quantum_features.to(dtype=features.dtype)
+            residual = residual_for_filters(features, self.filters)
+            features = residual + quantum_features.to(dtype=features.dtype)
+        elif self.replacement is not None:
+            features = residual_for_filters(features, self.filters) + self.replacement(features)
         features = self.post_quantum(features)
         features = self.global_pool(features).flatten(1)
         return self.classifier(features)

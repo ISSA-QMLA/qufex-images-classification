@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import zipfile
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -183,7 +184,7 @@ class GalaxyZooPreprocessor:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.raw_dir = config.paths.raw_dir
-        self.output_dir = config.paths.processed_dir
+        self.output_dir = config.cache_dir
 
     def _read_and_label(self) -> pd.DataFrame:
         mapping_path = self.raw_dir / "gz2_filename_mapping.csv"
@@ -247,6 +248,27 @@ class GalaxyZooPreprocessor:
         )
         return {"train": train, "validation": validation, "test": test}
 
+    def _subset(self, frame: pd.DataFrame, limit: int) -> pd.DataFrame:
+        """Largest-remainder allocation, retaining every class even for tiny subsets."""
+        if not limit or limit >= len(frame):
+            return frame.reset_index(drop=True)
+        rng = np.random.default_rng(self.config.data.subset_seed)
+        counts = frame["label"].value_counts().sort_index()
+        quotas = counts.to_numpy() * limit / len(frame)
+        allocation = np.maximum(np.floor(quotas).astype(int), 1)
+        while allocation.sum() > limit:
+            candidates = np.where(allocation > 1, allocation - quotas, -np.inf)
+            allocation[int(candidates.argmax())] -= 1
+        while allocation.sum() < limit:
+            candidates = np.where(allocation < counts.to_numpy(), quotas - allocation, -np.inf)
+            allocation[int(candidates.argmax())] += 1
+        pieces = []
+        for label, amount in zip(counts.index, allocation):
+            group = frame.loc[frame["label"] == label]
+            pieces.append(group.iloc[rng.permutation(len(group))[:amount]])
+        result = pd.concat(pieces)
+        return result.iloc[rng.permutation(len(result))].reset_index(drop=True)
+
     def _write_split(self, name: str, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         size = self.config.data.image_size
         images = np.lib.format.open_memmap(
@@ -290,7 +312,14 @@ class GalaxyZooPreprocessor:
         return mean.tolist(), np.sqrt(variance).tolist()
 
     def run(self) -> dict[str, Any]:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.config.cache_dir
+        if destination.exists():
+            metadata = validate_cache(self.config)
+            print(f"Using verified cache: {destination}")
+            return metadata
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.output_dir = destination.parent / f".{destination.name}.building-{uuid.uuid4().hex}"
+        self.output_dir.mkdir()
         frame = self._read_and_label()
         image_index = self._image_index()
         frame["image_path"] = frame["asset_id"].astype(str).map(image_index)
@@ -300,6 +329,8 @@ class GalaxyZooPreprocessor:
             raise RuntimeError("No clean labelled images remained after joining the official data products")
 
         split_frames = self._split(frame)
+        master_ids = {name: identity_digest(split["dr7objid"].astype(str)) for name, split in split_frames.items()}
+        split_frames = {name: self._subset(split, getattr(self.config.data, f"{name}_limit")) for name, split in split_frames.items()}
         arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for name, split_frame in split_frames.items():
             arrays[name] = self._write_split(name, split_frame.reset_index(drop=True))
@@ -307,6 +338,10 @@ class GalaxyZooPreprocessor:
 
         class_names = self.config.evaluation.class_names
         metadata: dict[str, Any] = {
+            "format_version": 2,
+            "data_signature": self.config.data_signature(),
+            "master_ids": master_ids,
+            "sources": {name: file_digest(self.raw_dir / name) for name in ("gz2_filename_mapping.csv", "gz2_hart16.csv.gz")},
             "image_size": self.config.data.image_size,
             "class_names": list(class_names),
             "class_to_index": {name: index for index, name in enumerate(class_names)},
@@ -320,11 +355,22 @@ class GalaxyZooPreprocessor:
             metadata["splits"][name] = {
                 "samples": int(len(labels)),
                 "class_counts": {class_names[i]: int(counts[i]) for i in range(len(class_names))},
+                "ids_sha256": identity_digest(split_frames[name]["dr7objid"].astype(str)),
             }
+        metadata["files"] = {path.name: {"sha256": file_digest(path), "size_bytes": path.stat().st_size}
+                             for path in self.output_dir.iterdir() if path.suffix in {".npy", ".csv"}}
+        metadata["dataset_id"] = hashlib.sha256(json.dumps(
+            {key: metadata[key] for key in ("data_signature", "sources", "master_ids", "files")}, sort_keys=True).encode()).hexdigest()
         (self.output_dir / "dataset_metadata.json").write_text(
             json.dumps(metadata, indent=2), encoding="utf-8"
         )
         self.config.save_resolved(self.output_dir)
+        for images_array, labels_array in arrays.values():
+            images_array._mmap.close()
+            labels_array._mmap.close()
+        # Publish only complete caches; failed builds remain isolated for inspection.
+        os.rename(self.output_dir, destination)
+        self.output_dir = destination
         print(json.dumps(metadata, indent=2))
         return metadata
 
@@ -339,12 +385,27 @@ class GalaxyDataset(TorchDataset):  # type: ignore[misc]
             )
         if split not in {"train", "validation", "test"}:
             raise ValueError("split must be train, validation, or test")
-        self.images = np.load(processed_dir / f"{split}_images.npy", mmap_mode="r")
-        self.labels = np.load(processed_dir / f"{split}_labels.npy", mmap_mode="r")
+        self.processed_dir = processed_dir
+        self.split = split
+        self._open_arrays()
         metadata = json.loads((processed_dir / "dataset_metadata.json").read_text(encoding="utf-8"))
         self.mean = torch.tensor(metadata["normalization_mean"], dtype=torch.float32).view(3, 1, 1)
         self.std = torch.tensor(metadata["normalization_std"], dtype=torch.float32).view(3, 1, 1)
         self.augment = augment
+
+    def _open_arrays(self) -> None:
+        self.images = np.load(self.processed_dir / f"{self.split}_images.npy", mmap_mode="r")
+        self.labels = np.load(self.processed_dir / f"{self.split}_labels.npy", mmap_mode="r")
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state.pop("images")
+        state.pop("labels")
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._open_arrays()
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -368,3 +429,53 @@ def iter_manifest_ids(processed_dir: Path, split: str) -> Iterator[str]:
 
     frame = pd.read_csv(processed_dir / f"{split}_manifest.csv", usecols=["dr7objid"], dtype="string")
     yield from frame["dr7objid"].astype(str)
+
+
+def identity_digest(ids: Any) -> str:
+    return hashlib.sha256("\n".join(ids).encode()).hexdigest()
+
+
+def validate_cache(config: AppConfig) -> dict[str, Any]:
+    """Validate provenance, file integrity, shapes, labels and disjoint identities."""
+    directory = config.cache_dir
+    hint = f"Run uv run --no-sync python -m scripts.preprocess_data --config configs/experiments.toml --profile {config.run.profile}. Cache: {directory}"
+    try:
+        metadata = json.loads((directory / "dataset_metadata.json").read_text(encoding="utf-8"))
+        if metadata.get("format_version") != 2 or metadata.get("data_signature") != config.data_signature():
+            raise ValueError("Dataset signature is incompatible")
+        expected_id = hashlib.sha256(json.dumps(
+            {key: metadata[key] for key in ("data_signature", "sources", "master_ids", "files")}, sort_keys=True).encode()).hexdigest()
+        if metadata.get("dataset_id") != expected_id:
+            raise ValueError("Dataset provenance is inconsistent")
+        for name, expected in metadata["sources"].items():
+            path = config.paths.raw_dir / name
+            if path.exists() and file_digest(path) != expected:
+                raise ValueError(f"Raw source changed: {name}; choose a new processed_dir to rebuild")
+        all_ids: set[str] = set()
+        for split in ("train", "validation", "test"):
+            for suffix in ("images.npy", "labels.npy", "manifest.csv"):
+                name = f"{split}_{suffix}"
+                path = directory / name
+                record = metadata["files"][name]
+                if path.stat().st_size != record["size_bytes"] or file_digest(path) != record["sha256"]:
+                    raise ValueError(f"Cache file changed: {name}; use a new processed_dir to rebuild")
+            images = np.load(directory / f"{split}_images.npy", mmap_mode="r")
+            labels = np.load(directory / f"{split}_labels.npy", mmap_mode="r")
+            manifest = pd.read_csv(directory / f"{split}_manifest.csv", dtype={"dr7objid": str})
+            size = config.data.image_size
+            if len(labels) == 0 or images.shape != (len(labels), size, size, 3) or images.dtype != np.uint8 or labels.dtype != np.int64:
+                raise ValueError(f"Invalid {split} array dimensions/dtypes")
+            if set(np.unique(labels)) != {0, 1, 2} or not np.array_equal(labels, manifest["label"].to_numpy()):
+                raise ValueError(f"Invalid {split} labels")
+            ids = manifest["dr7objid"].tolist()
+            if len(set(ids)) != len(ids) or all_ids.intersection(ids):
+                raise ValueError("Duplicate identities or split leakage")
+            all_ids.update(ids)
+            if metadata["splits"][split]["ids_sha256"] != identity_digest(ids) or metadata["splits"][split]["samples"] != len(labels):
+                raise ValueError(f"Invalid {split} identity metadata")
+        mean, std = np.asarray(metadata["normalization_mean"]), np.asarray(metadata["normalization_std"])
+        if mean.shape != (3,) or std.shape != (3,) or not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any():
+            raise ValueError("Invalid normalization statistics")
+        return metadata
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Dataset validation failed: {exc}. {hint}") from exc

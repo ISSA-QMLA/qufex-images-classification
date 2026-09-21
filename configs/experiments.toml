@@ -1,15 +1,15 @@
 # One source of truth. Profile tables merge; profile arrays REPLACE base arrays.
 [run]
 model = "qufex" # qufex | cnn_replacement | direct_cnn
-profile = "full128" # full64 | full128 | smoke | small_learning
+profile = "full64" # full64 | full128 | smoke | small_learning
 
 [paths]
 project_root = ".." # relative to this file; other paths relative to project_root
-raw_dir = "/data/qmla/famato/data/raw"
-processed_dir = "/data/qmla/famato/data/processed" # versioned caches live underneath
-runs_dir = "/data/qmla/famato/runs"
-checkpoints_dir = "/data/qmla/famato/checkpoints"
-results_dir = "/data/qmla/famato/results"
+raw_dir = "data/raw"
+processed_dir = "data/processed" # versioned caches live underneath
+runs_dir = "runs"
+checkpoints_dir = "checkpoints"
+results_dir = "results"
 
 [data]
 image_size = 64
@@ -21,7 +21,7 @@ subset_seed = 42
 train_limit = 0 # zero means entire split
 validation_limit = 0
 test_limit = 0
-num_workers = 2 # HPC loader workers
+num_workers = 0 # portable; increase explicitly on the workstation
 preprocessing_batch_size = 256
 clean_label_policy = "hart_clean_flags"
 
@@ -77,7 +77,7 @@ class_weighting = true
 checkpoint_every = 1 # epoch interval; final state is always saved
 seeds = [42]
 deterministic = false
-cpu_threads = 4 # leaves CPU capacity for loader workers
+cpu_threads = 4
 
 [evaluation]
 batch_size = 64
@@ -128,16 +128,3 @@ epochs = 100
 early_stopping_patience = 10
 [profiles.small_learning.evaluation]
 batch_size = 8
-
-# Representative pilot: production 128x128 architecture and batch sizes.
-[profiles.pilot128.data]
-image_size = 128
-train_limit = 1200
-validation_limit = 300
-test_limit = 300
-[profiles.pilot128.architectures.shared]
-encoder_channels = [4, 8, 8, 8, 16, 16]
-[profiles.pilot128.training]
-epochs = 2
-early_stopping_patience = 0
-seeds = [42]

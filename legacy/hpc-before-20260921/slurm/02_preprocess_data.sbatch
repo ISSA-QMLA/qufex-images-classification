@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#
 #SBATCH --job-name=qmla-preprocess
 #SBATCH --partition=master
 #SBATCH --output=logs/%x_%j.out
@@ -9,10 +10,13 @@
 #SBATCH --mem=16G
 #SBATCH --time=08:00:00
 #SBATCH --nodelist=treachery
+#
 
 set -euo pipefail
-cd /users/famato/QMLA/code/qmla
-export PATH="$HOME/.local/bin:$PATH"
-# Prepare the environment before submission; jobs never install dependencies.
+
 hostname
-uv run --no-sync python -u -m scripts.preprocess_data --config configs/hpc.toml --profile "${QMLA_PROFILE:-full128}"
+
+cd /users/famato/QMLA/code/qmla
+
+uv run --no-sync python -m scripts.preprocess_data \
+    --config configs/hpc.toml
