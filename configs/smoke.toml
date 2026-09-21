@@ -1,11 +1,11 @@
 [paths]
 # project_root is resolved relative to this file, not the shell working directory.
 project_root = ".."
-raw_dir = "data/raw"
-processed_dir = "data/processed"
-runs_dir = "runs"
-checkpoints_dir = "checkpoints"
-results_dir = "results"
+raw_dir = "/data/qmla/famato/data/raw"
+processed_dir = "/data/qmla/famato/data/processed_smoke"
+runs_dir = "/data/qmla/famato/runs"
+checkpoints_dir = "/data/qmla/famato/checkpoints"
+results_dir = "/data/qmla/famato/results"
 
 [data]
 image_size = 128
