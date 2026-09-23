@@ -115,6 +115,18 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    name: str = "none"
+    monitor: str = "macro_f1"
+    factor: float = 0.5
+    patience: int = 4
+    threshold: float = 0.001
+    threshold_mode: str = "abs"
+    cooldown: int = 0
+    min_lr: float = 0.000001
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     batch_size: int = 64
     save_predictions: bool = True
@@ -150,7 +162,7 @@ def relocate_paths(saved: dict, overrides: dict) -> dict:
 
 
 SCHEMA = {"run": RunConfig, "data": DataConfig, "quantum": QuantumConfig,
-          "training": TrainingConfig, "evaluation": EvaluationConfig,
+          "training": TrainingConfig, "scheduler": SchedulerConfig, "evaluation": EvaluationConfig,
           "architectures": {"shared": ArchitectureConfig, "direct": ArchitectureConfig, "replacement": ReplacementConfig},
           "paths": {name: None for name in ("project_root", "raw_dir", "processed_dir", "runs_dir", "checkpoints_dir", "results_dir")}}
 
@@ -203,6 +215,7 @@ class AppConfig:
     architectures: ArchitecturesConfig = field(default_factory=ArchitecturesConfig)
     quantum: QuantumConfig = field(default_factory=QuantumConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     source_path: Path | None = None
     overrides: dict = field(default_factory=dict)
@@ -233,7 +246,7 @@ class AppConfig:
             raise ConfigError("Data split fractions must be positive and sum to one")
         if self.data.clean_label_policy != "hart_clean_flags" or self.evaluation.class_names != CLASS_NAMES:
             raise ConfigError("Only the three ordered Hart clean-flag classes are supported")
-        for section in (self.data, self.training, self.evaluation, self.quantum):
+        for section in (self.data, self.training, self.scheduler, self.evaluation, self.quantum):
             for name, value in asdict(section).items():
                 if isinstance(value, int) and not isinstance(value, bool) and value < 0:
                     raise ConfigError(f"{name} must be nonnegative")
@@ -249,6 +262,19 @@ class AppConfig:
             raise ConfigError("training.seeds must contain distinct nonnegative integers")
         if self.training.optimizer not in {"adam", "adamw"} or self.training.learning_rate <= 0 or self.training.weight_decay < 0:
             raise ConfigError("Invalid optimizer, learning_rate, or weight_decay")
+        scheduler = self.scheduler
+        if scheduler.name not in {"none", "reduce_on_plateau"}:
+            raise ConfigError("scheduler.name must be none or reduce_on_plateau")
+        if scheduler.monitor not in {"macro_f1", "validation_loss"}:
+            raise ConfigError("scheduler.monitor must be macro_f1 or validation_loss")
+        if not 0 < scheduler.factor < 1:
+            raise ConfigError("scheduler.factor must be between zero and one (exclusive)")
+        if scheduler.threshold_mode not in {"abs", "rel"}:
+            raise ConfigError("scheduler.threshold_mode must be abs or rel")
+        if any(not math.isfinite(value) or value < 0 for value in (scheduler.threshold, scheduler.min_lr)):
+            raise ConfigError("scheduler.threshold and scheduler.min_lr must be finite and nonnegative")
+        if scheduler.name != "none" and scheduler.min_lr > self.training.learning_rate:
+            raise ConfigError("scheduler.min_lr cannot exceed training.learning_rate")
         device = self.training.device
         if device not in {"auto", "cpu", "cuda"} and not (device.startswith("cuda:") and device[5:].isdigit()):
             raise ConfigError("training.device must be auto, cpu, cuda, or cuda:N")
@@ -344,6 +370,7 @@ def config_from_dict(raw: dict, *, root: Path, source: Path | None = None, overr
         architectures=ArchitecturesConfig(_section(ArchitectureConfig, shared, "architectures.shared"), _section(ArchitectureConfig, direct, "architectures.direct"), _section(ReplacementConfig, architectures.get("replacement", {}), "architectures.replacement")),
         quantum=_section(QuantumConfig, raw.get("quantum", {}), "quantum"),
         training=_section(TrainingConfig, raw.get("training", {}), "training"),
+        scheduler=_section(SchedulerConfig, raw.get("scheduler", {}), "scheduler"),
         evaluation=_section(EvaluationConfig, raw.get("evaluation", {}), "evaluation"),
         source_path=source, overrides=overrides or {})
     config.validate()

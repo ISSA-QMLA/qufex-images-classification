@@ -77,6 +77,8 @@ def _check_checkpoint(checkpoint: dict, config: AppConfig, dataset_id: str, *, r
         previous = saved.resolved_dict()["training"]
         if any(current[k] != previous[k] for k in current if k not in ignored):
             raise RuntimeError("Resume requires the original optimizer, batch size, seed and stopping settings")
+        if saved.scheduler != config.scheduler:
+            raise RuntimeError("Resume requires the original scheduler settings; start a new run to change them")
 
 
 def seed_worker(_worker_id: int) -> None:
@@ -197,6 +199,19 @@ class Trainer:
             lr=config.training.learning_rate,
             weight_decay=config.training.weight_decay,
         )
+        self.scheduler = None
+        if config.scheduler.name == "reduce_on_plateau":
+            scheduler = config.scheduler
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="max" if scheduler.monitor == "macro_f1" else "min",
+                factor=scheduler.factor,
+                patience=scheduler.patience,
+                threshold=scheduler.threshold,
+                threshold_mode=scheduler.threshold_mode,
+                cooldown=scheduler.cooldown,
+                min_lr=scheduler.min_lr,
+            )
         self.amp_enabled = config.training.amp and self.device.type == "cuda"
         self.scaler = _make_grad_scaler(self.amp_enabled)
         self.start_epoch = 0
@@ -212,8 +227,15 @@ class Trainer:
         _check_checkpoint(checkpoint, self.config, self.metadata["dataset_id"], resume=True)
         if checkpoint.get("kind") != "latest":
             raise RuntimeError("Resume from latest.pt; best.pt is an evaluation checkpoint")
+        scheduler_state = checkpoint.get("scheduler_state")
+        if self.scheduler is not None and scheduler_state is None:
+            raise RuntimeError("Checkpoint is missing scheduler state; cannot resume the learning-rate schedule")
+        if self.scheduler is None and scheduler_state is not None:
+            raise RuntimeError("Checkpoint has scheduler state but scheduling is disabled")
         self.model.load_state_dict(checkpoint["model_state"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(scheduler_state)
         if checkpoint.get("scaler_state"):
             self.scaler.load_state_dict(checkpoint["scaler_state"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
@@ -242,6 +264,7 @@ class Trainer:
             "model_mode": self.mode,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict() if self.scheduler is not None else None,
             "scaler_state": self.scaler.state_dict(),
             "best_macro_f1": self.best_macro_f1,
             "bad_epochs": self.bad_epochs,
@@ -344,9 +367,18 @@ class Trainer:
             if patience and self.bad_epochs >= patience:
                 break
             epoch_started = time.perf_counter()
+            learning_rate = float(self.optimizer.param_groups[0]["lr"])
             train_loss = self._train_epoch()
             validation_loss, metrics = self._validate()
             score = float(metrics["macro_f1"])
+            if self.scheduler is not None:
+                monitored = score if self.config.scheduler.monitor == "macro_f1" else validation_loss
+                if not math.isfinite(monitored):
+                    raise RuntimeError("Non-finite validation metric; cannot step the learning-rate scheduler")
+                # The new rate applies to the NEXT epoch. Save this state with the
+                # updated optimizer so a resumed run makes the same future reductions.
+                self.scheduler.step(monitored)
+            next_learning_rate = float(self.optimizer.param_groups[0]["lr"])
             improved = score > self.best_macro_f1
             if improved:
                 self.best_macro_f1 = score
@@ -359,6 +391,8 @@ class Trainer:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
+                "learning_rate": learning_rate,
+                "next_learning_rate": next_learning_rate,
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 **{key: value for key, value in metrics.items() if key != "per_class"},
             }
@@ -366,7 +400,8 @@ class Trainer:
             last_epoch = epoch
             print(
                 f"epoch={epoch + 1}/{self.config.training.epochs} "
-                f"train_loss={train_loss:.5f} val_loss={validation_loss:.5f} macro_f1={score:.5f}"
+                f"train_loss={train_loss:.5f} val_loss={validation_loss:.5f} macro_f1={score:.5f} "
+                f"lr={learning_rate:.6g} next_lr={next_learning_rate:.6g}"
             )
             if (epoch + 1) % self.config.training.checkpoint_every == 0:
                 self._atomic_checkpoint(latest_path, epoch)
