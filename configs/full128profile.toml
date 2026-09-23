@@ -1,7 +1,7 @@
 # One source of truth. Profile tables merge; profile arrays REPLACE base arrays.
 [run]
 model = "qufex" # qufex | cnn_replacement | direct_cnn
-profile = "full64" # full64 | full128 | smoke | small_learning
+profile = "full128" # full64 | full128 | smoke | small_learning
 
 [paths]
 project_root = ".." # relative to this file; other paths relative to project_root
@@ -78,16 +78,6 @@ checkpoint_every = 1 # epoch interval; final state is always saved
 seeds = [42]
 deterministic = false
 cpu_threads = 4
-
-[scheduler]
-name = "none" # none | reduce_on_plateau; enable explicitly for the decay experiment
-monitor = "macro_f1" # validation macro_f1 (maximize) | validation_loss (minimize)
-factor = 0.5 # multiply the learning rate by this when the monitored metric plateaus
-patience = 4 # ReduceLROnPlateau reduces after MORE than this many bad epochs
-threshold = 0.001 # minimum improvement for the scheduler; separate from early stopping
-threshold_mode = "abs" # abs | rel
-cooldown = 0
-min_lr = 0.000001
 
 [evaluation]
 batch_size = 64

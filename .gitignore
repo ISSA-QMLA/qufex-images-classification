@@ -1,3 +1,6 @@
+scripts/slurm/*.example
+output/
+
 .venv/
 __pycache__/
 *.py[cod]

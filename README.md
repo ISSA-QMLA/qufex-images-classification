@@ -108,6 +108,28 @@ Full profiles stop after eight epochs without validation macro-F1 improvement, w
 
 The default analytic `default.qubit`/`backprop` combination supports CPU and CUDA. Other PennyLane backends require their own compatible installation and differentiation method; changing the backend alone does not guarantee acceleration. Finite shots cannot use backprop. The software validates known incompatible combinations and otherwise reports backend errors.
 
+### Optional learning-rate decay
+
+Scheduling is disabled by default (`scheduler.name = "none"`), including when older saved configurations omit the scheduler table. To compare experiment 2 against the longer-training experiment, keep its initial learning rate, batch sizes, seeds, data and architecture unchanged. Edit the existing `[training]` entries to `epochs = 100` and `early_stopping_patience = 15`, then edit or add this top-level table in the same configuration file (for example, `configs/hpc.toml` on the HPC):
+
+```toml
+[scheduler]
+name = "reduce_on_plateau"
+monitor = "macro_f1"
+factor = 0.5
+patience = 4
+threshold = 0.001
+threshold_mode = "abs"
+cooldown = 0
+min_lr = 0.000001
+```
+
+`ReduceLROnPlateau` steps once after each validation pass and changes the rate for the next training epoch. `macro_f1` monitors **validation** macro-F1 in maximization mode; `validation_loss` selects minimization mode. With the example above, an improvement must exceed 0.001 absolute F1, and five consecutive non-improving epochs trigger a halving of the learning rate. `patience = 0` reduces on the first bad epoch after the initial baseline. The floor is `min_lr`. Neither scheduler thresholds nor LR reductions change the existing best-checkpoint/early-stopping rule, which still counts any strict validation-F1 improvement; a reduction does not reset early-stopping patience. `cooldown` delays counting bad epochs after a reduction. Profiles may override settings with `[profiles.NAME.scheduler]`.
+
+Each history row and epoch log records `learning_rate` (used for that epoch) and `next_learning_rate` (after the scheduler step, even if training then stops). The results notebook plots the rates used alongside the loss/score analysis. Start a **fresh run** when enabling or changing the scheduler: resume requires the same scheduler and training settings, and restores scheduler counters together with the optimizer LR. Older format-2 fixed-rate checkpoints remain resumable with scheduling disabled.
+
+The existing three-task HPC Slurm array can continue to call `scripts.train --model ...` once per task using the edited config: each model gets its own process, optimizer and scheduler. No new preprocessing or scheduler CLI flag is needed. Keep the longer-training time allocation; the notebook can compare the new array directory with experiment 1 using matched models and seeds.
+
 ## Data integrity and portability
 
 Objects are deduplicated before the fixed stratified 70/15/15 master split. Small subsets are chosen within each split, retain all classes, and approximate original proportions. Normalization is computed only on the selected training images.
@@ -123,7 +145,7 @@ uv run --no-sync python -m scripts.train --config runs/RUN_NAME/resolved_config.
   --resume checkpoints/RUN_NAME/latest.pt --run-dir runs/RUN_NAME
 ```
 
-`latest.pt` stores model, optimizer, AMP scaler, Python/NumPy/Torch RNGs, loader generators, history, and the best model so far. Workers are recreated with reproducible seeds each epoch, and spawned workers reopen memory maps instead of copying arrays. Mid-epoch progress is not saved. CPU/CUDA relocation is supported; exact equality across devices or changed worker counts is not promised. `best.pt` is for evaluation, not resume. Format-1 checkpoints and former configuration files are intentionally unsupported; existing run artifacts remain untouched.
+`latest.pt` stores model, optimizer, optional LR scheduler, AMP scaler, Python/NumPy/Torch RNGs, loader generators, history, and the best model so far. Workers are recreated with reproducible seeds each epoch, and spawned workers reopen memory maps instead of copying arrays. Mid-epoch progress is not saved. CPU/CUDA relocation is supported; exact equality across devices or changed worker counts is not promised. `best.pt` is for evaluation, not resume. Format-1 checkpoints and former configuration files are intentionally unsupported; existing run artifacts remain untouched.
 
 ## Notebook and SLURM
 
