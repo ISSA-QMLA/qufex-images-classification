@@ -66,12 +66,12 @@ input_angle_scale = 3.141592653589793
 
 [training]
 device = "auto" # auto | cpu | cuda | cuda:N
-epochs = 50
+epochs = 100
 batch_size = 8
 optimizer = "adamw"
 learning_rate = 0.001
 weight_decay = 0.0001
-early_stopping_patience = 8 # zero disables stopping
+early_stopping_patience = 15 # zero disables stopping
 amp = true # CUDA only; quantum execution is outside autocast
 class_weighting = true
 checkpoint_every = 1 # epoch interval; final state is always saved

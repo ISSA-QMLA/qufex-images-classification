@@ -25,6 +25,18 @@ cd /users/famato/QMLA/code/qmla
 mkdir -p logs
 ```
 
+Check all three full128 models on synthetic images before preprocessing:
+
+```bash
+sbatch slurm/00_check_models.sbatch
+```
+
+Read `logs/qmla-check-models_JOBID.out` and `.err` after completion. Expect PASS
+for qufex, cnn_replacement, and direct_cnn. The job checks finite losses and
+gradients with the production training batch size and AMP setting. It does not
+read datasets or write checkpoints; resource sizing still requires the real-image
+pilot. It requests one GPU, four CPUs, 8 GB RAM, and ten minutes.
+
 The existing raw files remain available. The new preprocessing format requires
 versioned caches; old loose arrays are preserved but cannot replace these caches.
 Download only if the raw data need completing. Prepare the appropriate cache in a
@@ -54,6 +66,30 @@ Full training uses all split images, up to 50 epochs, and patience 8. Set multip
 training seeds in the config for repeated comparisons, and account for all three
 models and seeds in the walltime. Resume interruptions one model/seed at a time
 using the saved resolved configuration and latest.pt, as described in README.md.
+
+## Run the three models concurrently
+
+After full128 preprocessing, use the array instead of the sequential full job:
+
+```bash
+sbatch slurm/05_benchmark_full128_parallel.sbatch
+```
+
+Array tasks 0, 1 and 2 run qufex, cnn_replacement and direct_cnn respectively.
+Each task requests one GPU, eight CPUs, 16 GB RAM and 24 hours. Up to three tasks
+run concurrently when resources are available (three GPUs, 24 CPUs, 48 GB total).
+The existing configuration, batch sizes, seeds, datasets and evaluation procedure
+are unchanged. A single model still uses one GPU. This does not speed up QuFeX
+itself; total completion time is dominated by the slowest model.
+
+Logs are `logs/qmla-full128-parallel_ARRAYID_TASKID.out` and `.err`.
+Each model writes its own comparison/summary and run artifacts beneath
+`/data/qmla/famato/runs/full128_array_ARRAYID/`. Checkpoint and result names include
+the array ID and model to avoid collisions. Unlike scripts.benchmark, the array
+does not produce a combined three-model summary; collect the per-model comparison
+files after all tasks finish. To resume an interrupted task, use the saved
+resolved configuration and latest.pt for that model instead of resubmitting the
+array. The 24-hour limit applies separately to each task and is conservative.
 
 ## Previous setup
 
