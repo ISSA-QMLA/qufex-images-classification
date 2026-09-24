@@ -67,7 +67,7 @@ input_angle_scale = 3.141592653589793
 [training]
 device = "auto" # auto | cpu | cuda | cuda:N
 epochs = 100
-batch_size = 8
+batch_size = 32
 optimizer = "adamw"
 learning_rate = 0.001
 weight_decay = 0.0001
