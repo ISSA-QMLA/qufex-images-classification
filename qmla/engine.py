@@ -100,6 +100,8 @@ def classification_metrics(
     )
     return {
         "accuracy": float(accuracy_score(targets, predictions)),
+        "macro_precision": float(np.mean(precision)),
+        "macro_recall": float(np.mean(recall)),
         "balanced_accuracy": float(balanced_accuracy_score(targets, predictions)),
         "macro_f1": float(f1_score(targets, predictions, labels=np.arange(len(class_names)), average="macro", zero_division=0)),
         "weighted_f1": float(f1_score(targets, predictions, average="weighted", zero_division=0)),
@@ -423,7 +425,7 @@ class Trainer:
 
 
 class Evaluator:
-    """Restore one checkpoint and write complete test-set artifacts."""
+    """Restore one checkpoint and write artifacts for an unaugmented split."""
 
     def __init__(
         self,
@@ -432,7 +434,11 @@ class Evaluator:
         output_dir: Path,
         *,
         device_name: str | None = None,
+        split: str = "test",
     ) -> None:
+        if split not in ("train", "validation", "test"):
+            raise ValueError(f"Unknown evaluation split: {split}")
+        self.split = split
         torch = require_torch()
         from torch.utils.data import DataLoader
 
@@ -451,6 +457,8 @@ class Evaluator:
         configure_accelerator(self.device, deterministic=config.training.deterministic, cpu_threads=config.training.cpu_threads)
         checkpoint = _torch_load(self.checkpoint_path, "cpu")
         _check_checkpoint(checkpoint, config, self.metadata["dataset_id"])
+        self.checkpoint_epoch = int(checkpoint["epoch"])
+        self.seed = int(checkpoint["config"]["training"]["seeds"][0])
         self.mode = config.run.model
         self.model = GalaxyClassifier(config, mode=self.mode).to(self.device)
         try:
@@ -461,7 +469,7 @@ class Evaluator:
                 "saved beside the training run."
             ) from exc
         self.model.eval()
-        self.dataset = GalaxyDataset(config.cache_dir, "test", augment=False)
+        self.dataset = GalaxyDataset(config.cache_dir, split, augment=False)
         self.loader = DataLoader(
             self.dataset,
             batch_size=config.evaluation.batch_size,
@@ -507,6 +515,9 @@ class Evaluator:
         metrics = classification_metrics(targets, predictions, names)
         metrics["checkpoint"] = str(self.checkpoint_path)
         metrics["model_mode"] = self.mode
+        metrics["split"] = self.split
+        metrics["seed"] = self.seed
+        metrics["checkpoint_epoch"] = self.checkpoint_epoch
         (self.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         report = classification_report(
             targets,
@@ -518,7 +529,7 @@ class Evaluator:
         (self.output_dir / "classification_report.txt").write_text(report, encoding="utf-8")
 
         if self.config.evaluation.save_predictions:
-            manifest = pd.read_csv(self.config.cache_dir / "test_manifest.csv", dtype={"dr7objid": str})
+            manifest = pd.read_csv(self.config.cache_dir / f"{self.split}_manifest.csv", dtype={"dr7objid": str})
             manifest["target"] = targets
             manifest["prediction"] = predictions
             for index, name in enumerate(names):

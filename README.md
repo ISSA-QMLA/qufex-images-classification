@@ -149,6 +149,53 @@ uv run --no-sync python -m scripts.train --config runs/RUN_NAME/resolved_config.
 
 ## Notebook and SLURM
 
+### Compare best-checkpoint scores on all splits
+
+`scripts.evaluate_experiment` evaluates saved `best.pt` checkpoints for QuFeX and
+both CNN benchmarks without retraining. It discovers individual runs recursively,
+including separate model folders in a Slurm array. Every split uses evaluation
+mode with augmentation disabled; training-set scores describe the best checkpoint,
+not predictions collected during training epochs.
+
+Run on an HPC compute node from the repository root:
+
+```bash
+uv run --no-sync python -u -m scripts.evaluate_experiment \
+  --experiment-dir /data/qmla/famato/runs/full128_array_12560 \
+  --checkpoint-root /data/qmla/famato/checkpoints \
+  --processed-dir /data/qmla/famato/data/processed \
+  --output-dir /data/qmla/famato/results/split_evaluation/full128_array_12560 \
+  --device cuda --batch-size 32 --num-workers 0 --cpu-threads 8
+```
+
+The default evaluates `train validation test`; use `--splits validation test` to
+select fewer splits. Without `--checkpoint-root`, saved checkpoint references are
+used. Data paths default to the checkpoint configuration; use `--processed-dir`
+or the existing `--project-root` relocation option when needed. The processed
+directory is the **parent** of the `gz2-*` cache. Existing nonempty output
+directories are rejected; choose a new output directory when rerunning.
+
+Copy only `split_metrics.csv`, `per_class_metrics.csv`, and
+`evaluation_settings.json` from that output directory to the matching local
+`results/split_evaluation/full128_array_12560/` directory. In
+`notebooks/03-results-analysis.ipynb`, set:
+
+```python
+SPLIT_EVALUATIONS = {
+    'scheduled': RESULTS_ROOT / 'split_evaluation' / 'full128_array_12560',
+}
+```
+
+Use the same experiment label as in `EXPERIMENTS`. The notebook displays accuracy,
+macro precision/recall, a per-class breakdown, and mean/sample standard deviation
+across seeds (standard deviation is unavailable for one seed). CSV checkpoint
+epochs are zero-based; displayed best epochs are one-based. Split-specific full
+reports and predictions stay on the HPC. Saved training/test artifacts are preserved.
+A submission template is provided in
+`scripts/slurm/evaluate-experiment.sbatch`; edit its site/resource settings and
+create `logs/` before submission. Training already produces test reports, but this
+command recomputes all requested splits for one consistent evaluation export.
+
 Use [`notebooks/04-bottleneck-analysis.ipynb`](notebooks/04-bottleneck-analysis.ipynb) to visualize bottleneck interventions and linear-probe results from the HPC. The notebook reads only small CSV/JSON files and regenerates plots; it does not import Torch or load checkpoints, image arrays, or feature caches. Restart the kernel if the earlier notebook version was used for local processing.
 
 Run [`scripts/analyze_bottleneck.py`](scripts/analyze_bottleneck.py) in an HPC compute allocation using the existing project environment:
