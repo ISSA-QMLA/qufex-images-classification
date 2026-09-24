@@ -149,6 +149,23 @@ uv run --no-sync python -m scripts.train --config runs/RUN_NAME/resolved_config.
 
 ## Notebook and SLURM
 
+Use [`notebooks/04-bottleneck-analysis.ipynb`](notebooks/04-bottleneck-analysis.ipynb) to visualize bottleneck interventions and linear-probe results from the HPC. The notebook reads only small CSV/JSON files and regenerates plots; it does not import Torch or load checkpoints, image arrays, or feature caches. Restart the kernel if the earlier notebook version was used for local processing.
+
+Run [`scripts/analyze_bottleneck.py`](scripts/analyze_bottleneck.py) in an HPC compute allocation using the existing project environment:
+
+```bash
+uv run --no-sync python -u -m scripts.analyze_bottleneck \
+  --run-id 12560 \
+  --checkpoint-root /data/qmla/famato/checkpoints \
+  --processed-cache /data/qmla/famato/data/processed/gz2-128-c5b8192136704e32 \
+  --output-root /data/qmla/famato/results/bottleneck_analysis \
+  --device cuda --batch-size 32 --cpu-threads 4
+```
+
+The script processes QUFEX and CNN replacement one at a time, writes features batch by batch to memory-mapped `.npy` caches, then fits linear probes. It defaults to run `12560`; change `--run-id` for another experiment. If `--processed-cache` is omitted, the saved checkpoint configuration supplies the dataset path. CPU execution is available with `--device cpu`. A [SLURM template](scripts/slurm/bottleneck-analysis.sbatch.example) includes editable site/resource settings.
+
+Copy only `interventions.csv`, `intervention_summary.csv`, `probes.csv`, `probe_selection.csv`, and `analysis_settings.json` from `/data/qmla/famato/results/bottleneck_analysis/full128_array_12560/` to local `results/bottleneck_analysis/full128_array_12560/`. The two PNG exports are optional. Leave `features/`, checkpoints, and the dataset on HPC, then run the results notebook locally. No original-network retraining is performed. Verification and custom compatibility checks remain omitted. Fresh extraction is the default; use `--reuse-features` only with complete script-generated caches for unchanged inputs/settings (older notebook `.npz` caches are not reused). Outputs for the selected run are overwritten on rerun.
+
 Use [`notebooks/03-results-analysis.ipynb`](notebooks/03-results-analysis.ipynb) to analyse saved runs without training or loading checkpoints. Edit its experiment-directory mapping to compare Slurm arrays, sequential benchmarks, or individual runs. It plots losses and validation macro-F1, compares scores and stopping epochs, reports per-class test results, and supports paired comparisons across experiments and seeds. Run it on the HPC or point it at locally copied `runs/` and `results/` directories; optional CSV/PNG/PDF exports go to a separate analysis directory. Use validation results for tuning and test results for final reporting.
 
 Use [`notebooks/02-configurable-experiments.ipynb`](notebooks/02-configurable-experiments.ipynb) for the same resolver and run APIs with result plots. Select the uv-created `.venv` Python interpreter as the notebook kernel in your editor; `ipykernel` is installed by `uv sync`. The older exploratory notebook is preserved. Model graph rendering is not required.
