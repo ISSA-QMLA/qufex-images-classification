@@ -79,6 +79,12 @@ seeds = [42]
 deterministic = false
 cpu_threads = 4 # leaves CPU capacity for loader workers
 
+[scheduler]
+name = "reduce_on_plateau"
+monitor = "macro_f1"
+factor = 0.5
+patience = 4
+
 [evaluation]
 batch_size = 64
 save_predictions = true
