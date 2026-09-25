@@ -9,7 +9,7 @@ import random
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib
 
@@ -135,6 +135,7 @@ class Trainer:
         *,
         mode: str | None = None,
         device_name: str | None = None,
+        control: Callable[[str, Any], None] | None = None,
     ) -> None:
         torch = require_torch()
         from torch.utils.data import DataLoader
@@ -142,6 +143,8 @@ class Trainer:
         from qmla.model import GalaxyClassifier
 
         self.torch = torch
+        self.control = control
+        self.step_seconds: list[float] = []
         config = config.for_model(mode or config.run.model)
         if device_name:
             config = replace(config, training=replace(config.training, device=device_name))
@@ -162,7 +165,12 @@ class Trainer:
         if self.device.type == "cuda":
             self.model = self.model.to(memory_format=torch.channels_last)
 
-        train_dataset = GalaxyDataset(config.cache_dir, "train", augment=True)
+        if config.training.paired_randomness:
+            # Extractor construction must not advance the dropout/training RNG stream.
+            seed_everything(config.training.seeds[0] + 7919)
+
+        train_dataset = GalaxyDataset(config.cache_dir, "train", augment=True,
+                                      augmentation_seed=config.training.seeds[0] if config.training.paired_randomness else None)
         validation_dataset = GalaxyDataset(config.cache_dir, "validation", augment=False)
         self.loader_generator = torch.Generator().manual_seed(config.training.seeds[0])
         self.validation_generator = torch.Generator().manual_seed(config.training.seeds[0] + 1)
@@ -297,23 +305,40 @@ class Trainer:
         targets = targets.to(self.device, non_blocking=True)
         return inputs, targets
 
+    def _notify(self, event: str) -> None:
+        if self.control is not None:
+            if self.device.type == "cuda":
+                self.torch.cuda.synchronize(self.device)
+            self.control(event, self)
+
+    def _train_step(self, batch) -> tuple[float, int]:
+        inputs, targets = self._batch_to_device(batch)
+        self.optimizer.zero_grad(set_to_none=True)
+        with self.torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            logits = self.model(inputs)
+            loss = self.criterion(logits, targets)
+        if not self.torch.isfinite(loss):
+            raise RuntimeError("Non-finite training loss; no automatic device/model changes were made")
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return float(loss.detach()), len(targets)
+
     def _train_epoch(self) -> float:
         self.model.train()
         running_loss = 0.0
         samples = 0
         for batch in self.train_loader:
-            inputs, targets = self._batch_to_device(batch)
-            self.optimizer.zero_grad(set_to_none=True)
-            with self.torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                logits = self.model(inputs)
-                loss = self.criterion(logits, targets)
-            if not self.torch.isfinite(loss):
-                raise RuntimeError("Non-finite training loss; no automatic device/model changes were made")
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            running_loss += float(loss.detach()) * len(targets)
-            samples += len(targets)
+            self._notify("batch")
+            started = time.perf_counter()
+            loss, count = self._train_step(batch)
+            if self.control is not None:
+                if self.device.type == "cuda":
+                    self.torch.cuda.synchronize(self.device)
+                self.step_seconds.append(time.perf_counter() - started)
+            self._notify("batch")
+            running_loss += loss * count
+            samples += count
         return running_loss / max(samples, 1)
 
     def _validate(self) -> tuple[float, dict[str, Any]]:
@@ -324,6 +349,7 @@ class Trainer:
         predictions_all: list[np.ndarray] = []
         with self.torch.inference_mode():
             for batch in self.validation_loader:
+                self._notify("batch")
                 inputs, targets = self._batch_to_device(batch)
                 with self.torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                     logits = self.model(inputs)
@@ -333,6 +359,7 @@ class Trainer:
                 samples += len(targets)
                 targets_all.append(targets.cpu().numpy())
                 predictions_all.append(predictions.cpu().numpy())
+                self._notify("batch")
         metrics = classification_metrics(
             np.concatenate(targets_all),
             np.concatenate(predictions_all),
@@ -347,15 +374,20 @@ class Trainer:
         write_package_versions(self.run_dir)
         (self.run_dir / "dataset_metadata.json").write_text(json.dumps(self.metadata, indent=2), encoding="utf-8")
         initial_epochs = len(self.history)
-        with RuntimeMonitor(self.device) as monitor:
-            best = self._run_epochs()
-        stats = monitor.results((len(self.history) - initial_epochs) * len(self.train_loader.dataset))
-        stats.update({"parameter_count": sum(p.numel() for p in self.model.parameters()),
-                      "quantum_parameter_count": self.model.quantum_parameter_count,
-                      "dataset_id": self.metadata["dataset_id"], "model": self.mode,
-                      "seed": self.config.training.seeds[0], "epochs_completed": len(self.history),
-                      "throughput_scope": "training samples divided by training plus validation/checkpoint time for this invocation"})
-        (self.run_dir / "runtime.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        try:
+            with RuntimeMonitor(self.device) as monitor:
+                best = self._run_epochs()
+        finally:
+            stats = monitor.results((len(self.history) - initial_epochs) * len(self.train_loader.dataset))
+            stats.update({"parameter_count": sum(p.numel() for p in self.model.parameters()),
+                          "quantum_parameter_count": self.model.quantum_parameter_count,
+                          "dataset_id": self.metadata["dataset_id"], "model": self.mode,
+                          "seed": self.config.training.seeds[0], "epochs_completed": len(self.history),
+                          "training_step_count": len(self.step_seconds),
+                          "training_step_seconds_total": sum(self.step_seconds),
+                          "training_step_seconds_mean": float(np.mean(self.step_seconds)) if self.step_seconds else None,
+                          "throughput_scope": "completed epoch training samples divided by training plus validation/checkpoint time for this invocation"})
+            (self.run_dir / "runtime.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
         return best
 
     def _run_epochs(self) -> Path:
@@ -363,12 +395,15 @@ class Trainer:
         latest_path = self.checkpoint_dir / "latest.pt"
         last_epoch = self.start_epoch - 1
         patience = self.config.training.early_stopping_patience
+        if self.control is not None and not self.resumed:
+            self._atomic_checkpoint(latest_path, -1)
         if self.resumed and self.best_model_state is not None:
             self._atomic_checkpoint(best_path, self.best_epoch)
         for epoch in range(self.start_epoch, self.config.training.epochs):
             if patience and self.bad_epochs >= patience:
                 break
             epoch_started = time.perf_counter()
+            self.train_loader.dataset.epoch = epoch
             learning_rate = float(self.optimizer.param_groups[0]["lr"])
             train_loss = self._train_epoch()
             validation_loss, metrics = self._validate()
@@ -399,17 +434,19 @@ class Trainer:
                 **{key: value for key, value in metrics.items() if key != "per_class"},
             }
             self.history.append(record)
+            self._notify("epoch_metrics")
             last_epoch = epoch
             print(
                 f"epoch={epoch + 1}/{self.config.training.epochs} "
                 f"train_loss={train_loss:.5f} val_loss={validation_loss:.5f} macro_f1={score:.5f} "
                 f"lr={learning_rate:.6g} next_lr={next_learning_rate:.6g}"
             )
-            if (epoch + 1) % self.config.training.checkpoint_every == 0:
-                self._atomic_checkpoint(latest_path, epoch)
             if improved:
                 self._atomic_checkpoint(best_path, epoch)
+            if self.control is not None or (epoch + 1) % self.config.training.checkpoint_every == 0:
+                self._atomic_checkpoint(latest_path, epoch)
             self._save_history()
+            self._notify("epoch_complete")
             if patience and self.bad_epochs >= patience:
                 print(f"Early stopping after {self.bad_epochs} epochs without macro-F1 improvement")
                 break
@@ -435,10 +472,12 @@ class Evaluator:
         *,
         device_name: str | None = None,
         split: str = "test",
+        control: Callable[[], None] | None = None,
     ) -> None:
         if split not in ("train", "validation", "test"):
             raise ValueError(f"Unknown evaluation split: {split}")
         self.split = split
+        self.control = control
         torch = require_torch()
         from torch.utils.data import DataLoader
 
@@ -489,7 +528,9 @@ class Evaluator:
         metrics["parameter_count"] = sum(p.numel() for p in self.model.parameters())
         metrics["quantum_parameter_count"] = self.model.quantum_parameter_count
         metrics["dataset_id"] = self.metadata["dataset_id"]
-        (self.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        temporary = self.output_dir / "metrics.json.tmp"
+        temporary.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        temporary.replace(self.output_dir / "metrics.json")
         return metrics
 
     def _evaluate(self) -> dict[str, Any]:
@@ -498,6 +539,8 @@ class Evaluator:
         probability_batches: list[np.ndarray] = []
         with self.torch.inference_mode():
             for inputs, targets in self.loader:
+                if self.control is not None:
+                    self.control()
                 inputs = inputs.to(self.device, non_blocking=True)
                 if self.device.type == "cuda":
                     inputs = inputs.contiguous(memory_format=self.torch.channels_last)
@@ -507,6 +550,8 @@ class Evaluator:
                 target_batches.append(targets.numpy())
                 prediction_batches.append(probabilities.argmax(dim=1).cpu().numpy())
                 probability_batches.append(probabilities.cpu().numpy())
+                if self.control is not None:
+                    self.control()
 
         targets = np.concatenate(target_batches)
         predictions = np.concatenate(prediction_batches)
@@ -518,7 +563,6 @@ class Evaluator:
         metrics["split"] = self.split
         metrics["seed"] = self.seed
         metrics["checkpoint_epoch"] = self.checkpoint_epoch
-        (self.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         report = classification_report(
             targets,
             predictions,
