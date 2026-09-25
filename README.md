@@ -233,3 +233,186 @@ uv run --no-sync python -m pytest -q
 Tests cover configuration/profiles, all model variants and gradients, grouped residuals, cache integrity, stratification, deterministic CPU resume including a spawned worker, single-model smoke, paired benchmarks, and CUDA when available. The [real-image pilot report](docs/smoke-pilot.md) records successful CPU/CUDA smoke runs on this laptop. Tiny smoke accuracy is a pipeline check; robust research conclusions need repeated seeds and appropriate controls.
 
 The quantum circuit follows [QuFeX v1](https://arxiv.org/html/2501.13165v1). Data sources: [Galaxy Zoo 2](https://academic.oup.com/mnras/article/435/4/2835/1022913), [Hart et al.](https://academic.oup.com/mnras/article/461/4/3663/2608720), and the [Zenodo image release](https://zenodo.org/records/3565489).
+
+## Staged compression study
+
+The independent [`configs/compression_sweep.toml`](configs/compression_sweep.toml) configures
+[`scripts/compression_sweep.py`](scripts/compression_sweep.py). It does not inherit settings
+from `experiments.toml`. Its defaults are full 64×64 images, seeds **42, 1324, 987654**,
+50 epochs with patience 8, and a **0.05 absolute** acceptable drop in mean paired validation
+macro-F1 relative to M0. For example, a change from 0.90 to 0.85 is acceptable.
+
+```bash
+# Inspect the resolved experiment and resource counts without preparing data or training
+uv run --no-sync python -m scripts.compression_sweep --dry-run
+
+# Classical compression curve and direct-CNN reference only
+uv run --no-sync python -m scripts.compression_sweep --stage classical --run-dir runs/compression-study
+
+# Continue with profiling and quantum/control training; existing completed jobs are skipped
+uv run --no-sync python -m scripts.compression_sweep --stage quantum --run-dir runs/compression-study --resume
+
+# Or run both stages and generate reports in one invocation (test split is not evaluated)
+uv run --no-sync python -m scripts.compression_sweep --stage all --run-dir runs/new-compression-study
+
+# Rebuild tables/plots without training or evaluating checkpoints
+uv run --no-sync python -m scripts.compression_sweep --stage analyze --run-dir runs/compression-study
+
+# Freeze the completed checkpoint list and explicitly evaluate it on the held-out test split
+uv run --no-sync python -m scripts.compression_sweep --stage evaluate --run-dir runs/compression-study --resume
+```
+
+`--config`, `--device` and the usual project/data/output path overrides are supported.
+`--stage profile --resume --run-dir ...` profiles the selected quantum levels without training
+them. Run one process per study directory. Existing studies require `--resume` for execution;
+analysis can read an existing study without it. Scientific settings and budgets must match the
+original study; changing the device is allowed and each attempt records its hardware.
+
+| Level | C×H×W | Feature values | Forward circuit instances/image |
+|---|---:|---:|---:|
+| M0 | 64×8×8 | 4096 | 512 |
+| M1 | 64×6×6 | 2304 | 288 |
+| M2 | 64×4×4 | 1024 | 128 |
+| M3 | 64×2×2 | 256 | 32 |
+| M4 | 32×2×2 | 128 | 16 |
+| M5 | 16×2×2 | 64 | 8 |
+
+M0–M3 vary spatial compression; M4–M5 additionally reduce channels. Each model uses the direct
+CNN encoder, an optional channel projection and adaptive average pooling, a residual extraction
+module, global pooling and the classifier. The full CNN extraction module mixes all channels;
+the patch CNN and quantum module operate on identical nonoverlapping 2×2 patches of adjacent
+channel pairs. Shared components have paired initialization, and augmentation uses independent
+per-example/per-epoch random streams. The direct CNN reference retains its original architecture.
+
+The quantum circuit is always **8 qubits, 1 filter, 4 shared trainable parameters**, analytic
+`default.qubit` with backpropagation. Increasing representation size increases its application
+count, not qubit count or trainable circuit capacity. Circuit counts exclude measurement shots
+and gradient evaluations and are not counts of batched simulator calls. The default chunk size
+of 256 limits inputs to an individual circuit call; autograd can retain state across chunks, so
+total peak memory is measured independently. Simulator time is not a forecast of hardware time.
+
+Stage A completes every classical level/seed before selecting the most compressed acceptable
+level, including possible recovery after a worse level. Standard deviations describe seed
+variability; selection uses the mean paired drop, not a statistical significance test. If every
+level passes, M5 is selected and the study reports the observed range without inventing levels.
+Stage B visits the selected level, one more compressed level if available, then progressively
+larger representations. At each level it profiles a disposable quantum model (5 warm-up and
+20 measured optimizer steps), then trains fresh quantum and patch-CNN models for each seed.
+Cost estimates do not reject runs based on a hypothetical full 50-epoch duration.
+
+The **4-hour per-job** and **48-hour total-study** budgets persist across invocations. Profiling
+has its own per-job cap and counts against the total. Data preparation/integrity checking before
+execution is timed separately; downtime and regenerating analysis are excluded. Limits are
+checked between batches and can overrun by an in-flight batch and checkpoint finalization.
+Quantum time exhaustion or OOM stops expansion. Budget-exhausted and OOM jobs remain incomplete
+and are excluded from completed-run comparisons. Resume does not reset an exhausted budget.
+Interruptions resume from the last completed epoch (including an initial epoch -1 checkpoint);
+partial epochs are replayed, and previously consumed time remains charged. Abrupt process kills
+retain accounting through the last saved budget boundary.
+
+`study.json` is the persistent ledger; `selection.json` explains threshold selection. Each run
+has its own resolved configuration, package versions, history, runtime and checkpoints.
+`resolved_sweep.toml` saves the complete study with absolute paths; pass it as `--config` when
+resuming if the original configuration has since been edited.
+`analysis/` contains per-run and aggregated CSV/JSON tables, profiling results, paired differences,
+and performance/size/time/memory plots. Plots show complete seed sets; incomplete runs and partial
+seed sets remain explicitly labelled in the tables. Training-step timing excludes data loading;
+run time includes setup, validation and checkpointing. Time to the best checkpoint is recorded
+at the end of that epoch's validation, before checkpoint serialization.
+
+The explicit `evaluate` stage freezes checkpoint identities and SHA-256 hashes in
+`evaluation_manifest.json`, then writes test predictions and reports under `test/`. Subsequent
+evaluation resumes that same list; further exploration in a study with a frozen test list is
+rejected. Test scores never influence compression selection or expansion. Existing legacy
+configurations, checkpoints and the ordinary three-model benchmark remain supported.
+
+### Running the compression study on Dante
+
+[`scripts/slurm/compression-sweep.sbatch`](scripts/slurm/compression-sweep.sbatch) requests
+**one V100, four CPU threads, 32 GB host RAM and 50 hours**. On 2026-09-25, `ssh dante`
+reported the `master` partition with unlimited wall time and four 16 GB V100s on `treachery`.
+A short allocated CUDA forward/backward check passed with the existing Python environment
+(Torch 2.12.0+cu126). These are resource defaults, not a measured memory requirement or a
+guarantee that every quantum level will fit. The study retains its 48-hour accumulated budget;
+Slurm's extra two hours allow preparation and finalization overhead. Resources remain
+overridable through `sbatch` options.
+
+Use one process per study bundle. This trainer does not use multiple GPUs, and a Slurm array
+would race on the shared selection and budget. The launcher holds a `flock` lock to prevent
+concurrent writers, automatically resumes an existing study using its saved TOML, and saves
+checkpoints under the same bundle as the results. It records per-invocation source archives,
+package versions, resource allocation and logs. It never installs packages during an allocation.
+
+Transfer the **current implementation**, not just the Slurm files. From the local repository
+root, these commands package the study code without the dataset, virtual environment, previous
+results, main experiment configuration, or existing notebooks. The separate remote checkout
+preserves the existing HPC checkout and can use its installed dependencies:
+
+```powershell
+tar -czf compression-study-code.tar.gz --exclude=__pycache__ --exclude='*.pyc' qmla scripts configs/compression_sweep.toml notebooks/05-compression-sweep.ipynb pyproject.toml uv.lock README.md
+scp compression-study-code.tar.gz dante:/users/famato/QMLA/code/
+ssh dante "mkdir -p /users/famato/QMLA/code/compression-study && tar -xzf /users/famato/QMLA/code/compression-study-code.tar.gz -C /users/famato/QMLA/code/compression-study"
+```
+
+On Dante, submit CPU preprocessing first: the existing caches inspected on the HPC were
+128×128, whereas this study requires its own 64×64 cache. The preparation script uses the
+study's independent TOML and validates/reuses an existing matching cache. Raw data must
+already exist; it does not download data.
+
+```bash
+cd /users/famato/QMLA/code/compression-study
+export QMLA_PYTHON=/users/famato/QMLA/code/qmla/.venv/bin/python
+export QMLA_DATA_ROOT=/data/qmla/famato/data
+export QMLA_BUNDLE=/data/qmla/famato/results/compression-hpc
+prep=$(sbatch --parsable scripts/slurm/compression-prepare.sbatch)
+sbatch --dependency=afterok:"${prep%%;*}" scripts/slurm/compression-sweep.sbatch
+squeue -u "$USER"
+```
+
+`QMLA_STAGE` defaults to `all`, which excludes test evaluation. Other controls are `QMLA_CONFIG`
+(new studies only), `QMLA_REPO` (defaults to the submission directory), `QMLA_PYTHON`,
+`QMLA_DATA_ROOT` and `QMLA_BUNDLE`. Keep the same bundle and source checkout when resuming;
+use a new bundle for another experiment. Do not update source files while a job is running.
+An example shorter allocation, or a resume after interruption, is:
+
+```bash
+sbatch --time=12:00:00 scripts/slurm/compression-sweep.sbatch
+```
+
+The launcher requests a signal five minutes before wall time and forwards it to Python.
+The handler sets a flag; the next batch boundary saves interrupted status and accounting,
+then generates partial reports. Exit code **75** means resubmit the same command to resume.
+Partial epochs replay from the last completed epoch. Unlike a scientific run-time cap, a
+scheduler interruption does not mark the run `budget_exhausted` or stop quantum expansion.
+`--requeue` permits scheduler-initiated requeues; it does **not** automatically submit a new
+job after a time limit. If a batch or finalization exceeds the warning interval, Slurm can
+still kill the process; the previous completed checkpoint remains the resume point. See
+the [Slurm signal and requeue options](https://slurm.schedmd.com/sbatch.html).
+
+The bundle contains `study/` (state, histories, analysis and any explicit test results),
+`checkpoints/`, and `slurm/` (logs and source/environment provenance). Copy it after the job
+has stopped for a consistent snapshot. From the local repository root in PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force results | Out-Null
+scp -r dante:/data/qmla/famato/results/compression-hpc ./results/
+```
+
+Open [`notebooks/05-compression-sweep.ipynb`](notebooks/05-compression-sweep.ipynb) and set
+`BUNDLE` if you changed the directory name. It reads the copied state and relative histories,
+so it needs no HPC mount, dataset or checkpoint deserialization. It displays partial-run
+status, saved threshold decisions, paired comparisons, runtime and memory curves, learning
+histories and any frozen test results. Original absolute paths remain provenance only;
+do not run the training CLI against the copied HPC configuration to analyze it locally.
+
+Only when exploration is final, explicitly submit test evaluation on the HPC:
+
+```bash
+QMLA_STAGE=evaluate sbatch scripts/slurm/compression-sweep.sbatch
+```
+
+This uses the same persistent budgets and freezes the completed checkpoint list. If the
+48-hour study budget is already exhausted, this command cannot do more evaluation work;
+restarting does not grant a new budget. No test results are needed for the local validation
+analysis notebook. Inspect `study/study.json` and the job logs: Slurm `COMPLETED` means the
+script finished, which can also mean the scientific budget stopped an incomplete study.

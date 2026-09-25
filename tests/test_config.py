@@ -12,7 +12,7 @@ CANONICAL = Path(__file__).parents[1] / "configs" / "experiments.toml"
     ("full64", 64, (4, 8, 8, 8, 16), 0, 50),
     ("full128", 128, (4, 8, 8, 8, 16, 16), 0, 50),
     ("smoke", 32, (4, 4, 8, 16), 96, 1),
-    ("small_learning", 32, (4, 4, 8, 16), 1200, 3),
+    ("small_learning", 32, (4, 4, 8, 16), 1200, 100),
 ])
 def test_profiles(profile, size, widths, limit, epochs):
     config = load_config(CANONICAL, profile=profile)

@@ -1,0 +1,101 @@
+# Independent study configuration; does not inherit configs/experiments.toml.
+[run]
+model = "direct_cnn"
+profile = "compression64"
+
+[paths]
+project_root = ".."
+raw_dir = "data/raw"
+processed_dir = "data/processed"
+runs_dir = "runs"
+checkpoints_dir = "checkpoints"
+results_dir = "results"
+
+[data]
+image_size = 64
+train_fraction = 0.70
+validation_fraction = 0.15
+test_fraction = 0.15
+seed = 42
+subset_seed = 42
+train_limit = 0
+validation_limit = 0
+test_limit = 0
+num_workers = 0
+preprocessing_batch_size = 256
+clean_label_policy = "hart_clean_flags"
+
+[architectures.direct]
+encoder_channels = [16, 32, 64]
+convolutions_per_block = 1
+kernel_size = 3
+pooling = "max"
+pool_size = 2
+normalization = "batch"
+activation = "relu"
+projection = "auto"
+post_channels = []
+classifier_hidden_neurons = [32]
+dropout = 0.2
+
+[quantum]
+qubits = 8
+filters = 1
+backend = "default.qubit"
+diff_method = "backprop"
+shots = 0
+input_angle_scale = 3.141592653589793
+
+[training]
+device = "auto"
+epochs = 50
+batch_size = 8
+optimizer = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0001
+early_stopping_patience = 8
+amp = true
+class_weighting = true
+checkpoint_every = 1
+seeds = [42, 1324, 987654]
+deterministic = false
+cpu_threads = 4
+paired_randomness = true
+
+[scheduler]
+name = "none"
+
+[evaluation]
+batch_size = 8
+save_predictions = true
+save_confusion_matrix = true
+class_names = ["smooth", "unbarred_spiral", "barred_spiral"]
+
+[sweep]
+max_macro_f1_drop = 0.05 # absolute drop in mean paired validation macro-F1
+run_hours = 4.0
+total_hours = 48.0
+warmup_steps = 5
+measured_steps = 20
+circuit_chunk_size = 256
+include_more_compressed = true
+
+# Ordered least -> most compressed. Spatial sizes must be even; no upsampling.
+[sweep.levels.M0]
+channels = 64
+spatial_size = 8
+[sweep.levels.M1]
+channels = 64
+spatial_size = 6
+[sweep.levels.M2]
+channels = 64
+spatial_size = 4
+[sweep.levels.M3]
+channels = 64
+spatial_size = 2
+[sweep.levels.M4]
+channels = 32
+spatial_size = 2
+[sweep.levels.M5]
+channels = 16
+spatial_size = 2

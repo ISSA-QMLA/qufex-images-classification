@@ -48,9 +48,16 @@ def test_replacement_shares_weights_without_crossing_groups(tiny_config, qubits,
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("mode", ["qufex", "cnn_replacement", "direct_cnn"])
 def test_cuda_autocast_backward(tiny_config, mode):
-    model = GalaxyClassifier(tiny_config, mode=mode).cuda()
-    with torch.autocast("cuda"):
-        logits = model(torch.randn(2, 3, 32, 32, device="cuda"))
-        loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1], device="cuda"))
-    loss.backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    # CPU trainer tests enable this process-global flag; adaptive pooling on CUDA
+    # does not support it. Keep this AMP test independent of collection order.
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(False)
+        model = GalaxyClassifier(tiny_config, mode=mode).cuda()
+        with torch.autocast("cuda"):
+            logits = model(torch.randn(2, 3, 32, 32, device="cuda"))
+            loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1], device="cuda"))
+        loss.backward()
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    finally:
+        torch.use_deterministic_algorithms(deterministic)
