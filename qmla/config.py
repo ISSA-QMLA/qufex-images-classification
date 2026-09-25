@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 MODELS = ("qufex", "cnn_replacement", "direct_cnn")
+COMPRESSION_MODELS = ("compression_cnn", "compression_patch_cnn", "compression_qufex")
 CLASS_NAMES = ("smooth", "unbarred_spiral", "barred_spiral")
 
 
@@ -67,6 +68,7 @@ class ArchitectureConfig:
     post_convolutions: int = 1
     classifier_hidden_neurons: tuple[int, ...] = (32,)
     dropout: float = 0.2
+    circuit_chunk_size: int = 256
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ class TrainingConfig:
     seeds: tuple[int, ...] = (42,)
     deterministic: bool = False
     cpu_threads: int = 4
+    paired_randomness: bool = False
 
 
 @dataclass(frozen=True)
@@ -239,8 +242,8 @@ class AppConfig:
         return result
 
     def validate(self) -> None:
-        if self.run.model not in MODELS:
-            raise ConfigError(f"run.model must be one of {MODELS}")
+        if self.run.model not in MODELS + COMPRESSION_MODELS:
+            raise ConfigError(f"run.model must be one of {MODELS + COMPRESSION_MODELS}")
         fractions = (self.data.train_fraction, self.data.validation_fraction, self.data.test_fraction)
         if any(not 0 < x < 1 for x in fractions) or not math.isclose(sum(fractions), 1, abs_tol=1e-8):
             raise ConfigError("Data split fractions must be positive and sum to one")
@@ -299,7 +302,21 @@ class AppConfig:
             raise ConfigError("Invalid replacement channels or kernels")
         if rep.activation not in activations or rep.output_activation not in activations or rep.normalization not in {"batch", "group", "none"}:
             raise ConfigError("Invalid replacement activation/normalization")
-        if self.run.model != "direct_cnn":
+        if self.run.model in COMPRESSION_MODELS:
+            if any(v < 2 or v % 2 for v in (arch.compression_channels, arch.quantum_spatial_size)):
+                raise ConfigError("Compression channels and spatial size must be positive even integers")
+            if arch.quantum_spatial_size > spatial:
+                raise ConfigError("Compression cannot upsample encoder features")
+            if arch.circuit_chunk_size < 1:
+                raise ConfigError("circuit_chunk_size must be positive")
+            if arch.projection == "identity" and arch.encoder_channels[-1] != arch.compression_channels:
+                raise ConfigError("Identity projection requires matching channels")
+            if (self.quantum.qubits, self.quantum.filters, self.quantum.backend,
+                self.quantum.diff_method, self.quantum.shots) != (8, 1, "default.qubit", "backprop", 0):
+                raise ConfigError("Compression study requires analytic eight-qubit, one-filter default.qubit/backprop")
+            if self.quantum.input_angle_scale <= 0:
+                raise ConfigError("quantum.input_angle_scale must be positive")
+        elif self.run.model != "direct_cnn":
             if arch.compression_channels != 16 or arch.quantum_spatial_size != 2 or spatial < 2:
                 raise ConfigError("QuFeX/replacement require compression_channels=16, quantum_spatial_size=2 and encoder spatial size >=2")
             if arch.projection == "identity" and arch.encoder_channels[-1] != 16:

@@ -378,7 +378,8 @@ class GalaxyZooPreprocessor:
 class GalaxyDataset(TorchDataset):  # type: ignore[misc]
     """Memory-mapped processed split with lightweight tensor augmentation."""
 
-    def __init__(self, processed_dir: Path, split: str, *, augment: bool = False) -> None:
+    def __init__(self, processed_dir: Path, split: str, *, augment: bool = False,
+                 augmentation_seed: int | None = None) -> None:
         if torch is None:
             raise ImportError(
                 "PyTorch is required for GalaxyDataset. Install the cluster-appropriate PyTorch build first."
@@ -392,6 +393,8 @@ class GalaxyDataset(TorchDataset):  # type: ignore[misc]
         self.mean = torch.tensor(metadata["normalization_mean"], dtype=torch.float32).view(3, 1, 1)
         self.std = torch.tensor(metadata["normalization_std"], dtype=torch.float32).view(3, 1, 1)
         self.augment = augment
+        self.augmentation_seed = augmentation_seed
+        self.epoch = 0
 
     def _open_arrays(self) -> None:
         self.images = np.load(self.processed_dir / f"{self.split}_images.npy", mmap_mode="r")
@@ -414,11 +417,15 @@ class GalaxyDataset(TorchDataset):  # type: ignore[misc]
         # Copy removes the read-only memmap warning and lets augmentation modify safely.
         image = torch.from_numpy(np.asarray(self.images[index]).copy()).permute(2, 0, 1).float().div_(255.0)
         if self.augment:
-            if torch.rand(()) < 0.5:
+            generator = None
+            if self.augmentation_seed is not None:
+                generator = torch.Generator().manual_seed(
+                    (self.augmentation_seed + 1000003 * self.epoch + 9176 * index) % (2**63 - 1))
+            if torch.rand((), generator=generator) < 0.5:
                 image = torch.flip(image, dims=(2,))
-            if torch.rand(()) < 0.5:
+            if torch.rand((), generator=generator) < 0.5:
                 image = torch.flip(image, dims=(1,))
-            image = torch.rot90(image, int(torch.randint(0, 4, ()).item()), dims=(1, 2))
+            image = torch.rot90(image, int(torch.randint(0, 4, (), generator=generator).item()), dims=(1, 2))
         image = (image - self.mean) / self.std
         label = torch.tensor(int(self.labels[index]), dtype=torch.long)
         return image, label

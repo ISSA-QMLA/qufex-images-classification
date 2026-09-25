@@ -174,6 +174,10 @@ class QuFeXLayer(nn.Module):
             outputs = torch.stack(tuple(outputs), dim=-1)
         return outputs.to(dtype=inputs.dtype)
 
+    def apply_filter(self, inputs: torch.Tensor, index: int = 0) -> torch.Tensor:
+        """Execute one shared filter on a batch of already encoded input vectors."""
+        return self._stack_measurements(self._circuits[index](inputs, self.theta[index]), inputs)
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim != 4 or tuple(inputs.shape[1:]) != (16, 2, 2):
             raise ValueError(f"QuFeXLayer expects [batch, 16, 2, 2], received {tuple(inputs.shape)}")
@@ -182,10 +186,7 @@ class QuFeXLayer(nn.Module):
             # tf.split(..., axis=-1) into adjacent channel pairs + Keras Flatten.
             grouped = inputs.reshape(batch, 8, 2, 2, 2).permute(0, 1, 3, 4, 2)
             circuit_inputs = grouped.reshape(batch * 8, 8)
-            outputs = self._stack_measurements(
-                self._circuits[0](circuit_inputs, self.theta[0]),
-                inputs,
-            )
+            outputs = self.apply_filter(circuit_inputs)
             # Gather even/odd measurements into the two output maps per group.
             maps = outputs.reshape(batch, 8, 2, 2, 2).permute(0, 1, 4, 2, 3)
             return maps.reshape(batch, 16, 2, 2)
@@ -236,6 +237,48 @@ def residual_for_filters(features: torch.Tensor, filters: int) -> torch.Tensor:
     return features.repeat_interleave(filters, dim=1) if filters > 1 else features
 
 
+def pack_patches(inputs: torch.Tensor) -> torch.Tensor:
+    """[B,C,H,W] -> [B*C/2*H/2*W/2,2,2,2], adjacent channel pairs."""
+    if inputs.ndim != 4 or any(d < 2 or d % 2 for d in inputs.shape[1:]):
+        raise ValueError("Patch extraction requires even positive C, H, W")
+    b, c, h, w = inputs.shape
+    return inputs.reshape(b, c // 2, 2, h // 2, 2, w // 2, 2).permute(
+        0, 1, 3, 5, 2, 4, 6).reshape(-1, 2, 2, 2)
+
+
+def unpack_patches(patches: torch.Tensor, shape: tuple) -> torch.Tensor:
+    b, c, h, w = shape
+    return patches.reshape(b, c // 2, h // 2, w // 2, 2, 2, 2).permute(
+        0, 1, 4, 2, 5, 3, 6).reshape(shape)
+
+
+class PatchQuFeXLayer(QuFeXLayer):
+    """Existing 8(1) circuit, shared across nonoverlapping two-channel patches."""
+
+    def __init__(self, *, chunk_size: int = 256, **kwargs) -> None:
+        super().__init__(**kwargs)
+        if (self.qubits, self.filters) != (8, 1) or chunk_size < 1:
+            raise ValueError("PatchQuFeX requires 8/1 and positive chunk_size")
+        self.chunk_size = chunk_size
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        patches = pack_patches(inputs)
+        # Match the published spatial-major, channel-interleaved encoding.
+        vectors = patches.permute(0, 2, 3, 1).reshape(-1, 8)
+        outputs = torch.cat([self.apply_filter(part) for part in vectors.split(self.chunk_size)])
+        maps = outputs.reshape(-1, 2, 2, 2).permute(0, 3, 1, 2)
+        return unpack_patches(maps, inputs.shape)
+
+
+class PatchCNN(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(nn.Conv2d(2, 8, 3, padding=1), nn.ReLU(), nn.Conv2d(8, 2, 1))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return unpack_patches(self.network(pack_patches(inputs)), inputs.shape)
+
+
 class GalaxyClassifier(nn.Module):
     """Configurable QuFeX, grouped CNN replacement, or direct CNN."""
 
@@ -269,11 +312,18 @@ class GalaxyClassifier(nn.Module):
         self.compression = nn.Sequential(*bottleneck)
 
         self.qufex: QuFeXLayer | None = None
-        self.replacement: CNNReplacement | None = None
+        self.replacement: nn.Module | None = None
         if self.mode == "qufex":
             self.qufex = QuFeXLayer(**asdict(config.quantum))
         elif self.mode == "cnn_replacement":
             self.replacement = CNNReplacement(config.architectures.replacement, config.quantum.qubits, config.quantum.filters)
+        elif self.mode == "compression_qufex":
+            self.qufex = PatchQuFeXLayer(chunk_size=arch.circuit_chunk_size, **asdict(config.quantum))
+        elif self.mode == "compression_patch_cnn":
+            self.replacement = PatchCNN()
+        elif self.mode == "compression_cnn":
+            self.replacement = nn.Sequential(nn.Conv2d(current_channels, current_channels, 3, padding=1),
+                                             nn.ReLU(), nn.Conv2d(current_channels, current_channels, 1))
         self.filters = config.quantum.filters if self.mode != "direct_cnn" else 1
 
         post_layers: list[nn.Module] = []
@@ -292,6 +342,14 @@ class GalaxyClassifier(nn.Module):
             current_features = hidden
         head.append(nn.Linear(current_features, len(config.evaluation.class_names)))
         self.classifier = nn.Sequential(*head)
+        if config.training.paired_randomness:
+            # Independent streams: extractor allocation must not change common weights.
+            for offset, module in enumerate((self.encoder, self.compression, self.post_quantum, self.classifier)):
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(config.training.seeds[0] + 1009 * (offset + 1))
+                    for child in module.modules():
+                        if hasattr(child, "reset_parameters"):
+                            child.reset_parameters()
 
     @property
     def quantum_parameter_count(self) -> int:
