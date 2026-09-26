@@ -22,6 +22,18 @@ def study_for(config, *, seeds=(42,)):
                        {"M0": Level(4, 4), "M1": Level(4, 2)})
 
 
+def test_prepare_stage_creates_and_reuses_cache_without_a_study(raw_data, monkeypatch):
+    from scripts import compression_sweep as cli
+    study = study_for(raw_data)
+    monkeypatch.setattr(cli, "load_study", lambda *_a, **_k: study)
+    monkeypatch.setattr(cli, "StudyRunner", lambda *_a, **_k: pytest.fail("Preparation must not start a study"))
+    monkeypatch.setattr("sys.argv", ["compression_sweep", "--stage", "prepare"])
+    cli.main()
+    assert study.config.cache_dir.exists()
+    monkeypatch.setattr(cli, "GalaxyZooPreprocessor", lambda *_a: pytest.fail("Existing cache should be reused"))
+    cli.main()
+
+
 def test_standalone_defaults_and_validation(tiny_config):
     study = load_study(Path(__file__).parents[1] / "configs/compression_sweep.toml")
     assert study.config.training.seeds == (42, 1324, 987654)

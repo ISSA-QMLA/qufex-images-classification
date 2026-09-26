@@ -328,91 +328,76 @@ configurations, checkpoints and the ordinary three-model benchmark remain suppor
 
 ### Running the compression study on Dante
 
-[`scripts/slurm/compression-sweep.sbatch`](scripts/slurm/compression-sweep.sbatch) requests
-**one V100, four CPU threads, 32 GB host RAM and 50 hours**. On 2026-09-25, `ssh dante`
-reported the `master` partition with unlimited wall time and four 16 GB V100s on `treachery`.
-A short allocated CUDA forward/backward check passed with the existing Python environment
-(Torch 2.12.0+cu126). These are resource defaults, not a measured memory requirement or a
-guarantee that every quantum level will fit. The study retains its 48-hour accumulated budget;
-Slurm's extra two hours allow preparation and finalization overhead. Resources remain
-overridable through `sbatch` options.
+The small templates
+[`compression-sweep.sbatch.example`](scripts/slurm/compression-sweep.sbatch.example) and
+[`compression-prepare.sbatch.example`](scripts/slurm/compression-prepare.sbatch.example)
+use explicit paths and commands. Keep the templates on `main`; copy and edit the actual
+`.sbatch` files on your `hpc` branch. Merge `origin/main` into `hpc` through your usual
+GitHub workflow before the first run.
 
-Use one process per study bundle. This trainer does not use multiple GPUs, and a Slurm array
-would race on the shared selection and budget. The launcher holds a `flock` lock to prevent
-concurrent writers, automatically resumes an existing study using its saved TOML, and saves
-checkpoints under the same bundle as the results. It records per-invocation source archives,
-package versions, resource allocation and logs. It never installs packages during an allocation.
-
-Transfer the **current implementation**, not just the Slurm files. From the local repository
-root, these commands package the study code without the dataset, virtual environment, previous
-results, main experiment configuration, or existing notebooks. The separate remote checkout
-preserves the existing HPC checkout and can use its installed dependencies:
-
-```powershell
-tar -czf compression-study-code.tar.gz --exclude=__pycache__ --exclude='*.pyc' qmla scripts configs/compression_sweep.toml notebooks/05-compression-sweep.ipynb pyproject.toml uv.lock README.md
-scp compression-study-code.tar.gz dante:/users/famato/QMLA/code/
-ssh dante "mkdir -p /users/famato/QMLA/code/compression-study && tar -xzf /users/famato/QMLA/code/compression-study-code.tar.gz -C /users/famato/QMLA/code/compression-study"
-```
-
-On Dante, submit CPU preprocessing first: the existing caches inspected on the HPC were
-128×128, whereas this study requires its own 64×64 cache. The preparation script uses the
-study's independent TOML and validates/reuses an existing matching cache. Raw data must
-already exist; it does not download data.
+On Dante, from the repository root, copy the simplified template into your HPC script
+(reapply any custom paths there), then submit it:
 
 ```bash
-cd /users/famato/QMLA/code/compression-study
-export QMLA_PYTHON=/users/famato/QMLA/code/qmla/.venv/bin/python
-export QMLA_DATA_ROOT=/data/qmla/famato/data
-export QMLA_BUNDLE=/data/qmla/famato/results/compression-hpc
-prep=$(sbatch --parsable scripts/slurm/compression-prepare.sbatch)
-sbatch --dependency=afterok:"${prep%%;*}" scripts/slurm/compression-sweep.sbatch
-squeue -u "$USER"
+cd /users/famato/QMLA/code/qmla
+mkdir -p logs
+cp scripts/slurm/compression-sweep.sbatch.example scripts/slurm/compression-sweep.sbatch
+sbatch scripts/slurm/compression-sweep.sbatch
 ```
 
-`QMLA_STAGE` defaults to `all`, which excludes test evaluation. Other controls are `QMLA_CONFIG`
-(new studies only), `QMLA_REPO` (defaults to the submission directory), `QMLA_PYTHON`,
-`QMLA_DATA_ROOT` and `QMLA_BUNDLE`. Keep the same bundle and source checkout when resuming;
-use a new bundle for another experiment. Do not update source files while a job is running.
-An example shorter allocation, or a resume after interruption, is:
+That single job prepares the 64x64 cache if missing, trains the classical and quantum
+stages, and writes analysis. No separate preparation job or dependency command is required.
+It uses the existing raw data under `/data/qmla/famato/data`; no downloads or package
+installation happen in the job. Prepare the Linux `.venv` with uv as described above.
+
+The template requests one GPU on `treachery`, four CPU threads, 32 GB host RAM and 50 hours,
+allowing overhead around the study's 48-hour budget. There is no array: all stages and seeds
+share one selection and accumulated budget. Submit only one job at a time for a given bundle.
+
+Edit these values directly in your HPC copy:
+
+- `config`: defaults to `configs/compression_sweep.toml`. For branch-specific settings, copy
+  that file to `configs/compression_sweep_hpc.toml` and use it here. The existing `hpc.toml`
+  is independent of this study.
+- `bundle`: defaults to `/data/qmla/famato/results/compression-hpc`. Use a new directory
+  for a new experiment.
+- `--stage all`: performs exploration and analysis, without test evaluation.
+
+**To resume**, keep the same bundle, set `config="$run_dir/resolved_sweep.toml"` and add
+`--resume` to the Python command. Then submit the same file again. Resume preserves the
+original scientific settings and consumed budgets; it does not grant extra training time.
+A fresh launch against an existing study fails until you explicitly add `--resume`.
+
+The `exec .venv/bin/python` line replaces the batch shell with Python, allowing Slurm's
+five-minute warning signal to reach the existing checkpoint-aware handler directly.
+Exit code 75 means an interruption that can be resumed. Partial epochs replay from the last
+completed epoch; forced termination retains the last saved checkpoint. A scientific
+`budget_exhausted` status remains capped on restart. Do not update code during a running job.
+
+CPU preprocessing is optional if you want to avoid reserving a GPU during cache creation:
 
 ```bash
-sbatch --time=12:00:00 scripts/slurm/compression-sweep.sbatch
+cp scripts/slurm/compression-prepare.sbatch.example scripts/slurm/compression-prepare.sbatch
+sbatch scripts/slurm/compression-prepare.sbatch
 ```
 
-The launcher requests a signal five minutes before wall time and forwards it to Python.
-The handler sets a flag; the next batch boundary saves interrupted status and accounting,
-then generates partial reports. Exit code **75** means resubmit the same command to resume.
-Partial epochs replay from the last completed epoch. Unlike a scientific run-time cap, a
-scheduler interruption does not mark the run `budget_exhausted` or stop quantum expansion.
-`--requeue` permits scheduler-initiated requeues; it does **not** automatically submit a new
-job after a time limit. If a batch or finalization exceeds the warning interval, Slurm can
-still kill the process; the previous completed checkpoint remains the resume point. See
-the [Slurm signal and requeue options](https://slurm.schedmd.com/sbatch.html).
+Wait for it to finish successfully before submitting the sweep. If using a custom study
+configuration, set the same config path in both files. The preparation command uses
+`--stage prepare`, which creates/validates the cache without starting a study.
 
-The bundle contains `study/` (state, histories, analysis and any explicit test results),
-`checkpoints/`, and `slurm/` (logs and source/environment provenance). Copy it after the job
-has stopped for a consistent snapshot. From the local repository root in PowerShell:
+Slurm logs go to `logs/`. The bundle contains `study/` (state, histories, resolved
+configuration and analysis) and `checkpoints/`. After the job stops, copy the bundle from
+your local repository in PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force results | Out-Null
 scp -r dante:/data/qmla/famato/results/compression-hpc ./results/
 ```
 
-Open [`notebooks/05-compression-sweep.ipynb`](notebooks/05-compression-sweep.ipynb) and set
-`BUNDLE` if you changed the directory name. It reads the copied state and relative histories,
-so it needs no HPC mount, dataset or checkpoint deserialization. It displays partial-run
-status, saved threshold decisions, paired comparisons, runtime and memory curves, learning
-histories and any frozen test results. Original absolute paths remain provenance only;
-do not run the training CLI against the copied HPC configuration to analyze it locally.
+Open [`notebooks/05-compression-sweep.ipynb`](notebooks/05-compression-sweep.ipynb).
+It reads the copied results and relative histories without HPC dataset paths.
 
-Only when exploration is final, explicitly submit test evaluation on the HPC:
-
-```bash
-QMLA_STAGE=evaluate sbatch scripts/slurm/compression-sweep.sbatch
-```
-
-This uses the same persistent budgets and freezes the completed checkpoint list. If the
-48-hour study budget is already exhausted, this command cannot do more evaluation work;
-restarting does not grant a new budget. No test results are needed for the local validation
-analysis notebook. Inspect `study/study.json` and the job logs: Slurm `COMPLETED` means the
-script finished, which can also mean the scientific budget stopped an incomplete study.
+For final test evaluation, set `config="$run_dir/resolved_sweep.toml"`, change the command
+to `--stage evaluate` and include `--resume`. This freezes the completed checkpoint list
+and uses the same remaining study budget. Inspect `study/study.json` as well as the logs:
+Slurm completion can mean the scientific budget stopped an incomplete study.

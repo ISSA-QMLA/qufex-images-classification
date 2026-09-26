@@ -6,12 +6,13 @@ from pathlib import Path
 
 from qmla.cli import PATH_OPTIONS, path_overrides, resolve_job_path
 from qmla.compression_study import StudyRunner, load_study
+from qmla.data import GalaxyZooPreprocessor, validate_cache
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/compression_sweep.toml")
-    parser.add_argument("--stage", choices=("classical", "profile", "quantum", "analyze", "evaluate", "all"), default="all")
+    parser.add_argument("--stage", choices=("prepare", "classical", "profile", "quantum", "analyze", "evaluate", "all"), default="all")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device")
@@ -23,6 +24,15 @@ def main():
         study = load_study(args.config, device=args.device, paths=path_overrides(args))
         if args.dry_run:
             print(json.dumps(study.description(), indent=2))
+            return
+        if args.stage == "prepare":
+            if args.run_dir is not None or args.resume:
+                raise ValueError("--stage prepare only prepares data; omit --run-dir and --resume")
+            if not study.config.cache_dir.exists():
+                GalaxyZooPreprocessor(study.config).run()
+            metadata = validate_cache(study.config)
+            print(f"Prepared cache: {study.config.cache_dir}")
+            print(f"Dataset identity: {metadata['dataset_id']}")
             return
         if args.resume and args.run_dir is None:
             raise ValueError("--resume requires --run-dir")
