@@ -1,7 +1,7 @@
 # One source of truth. Profile tables merge; profile arrays REPLACE base arrays.
 [run]
 model = "qufex" # qufex | cnn_replacement | direct_cnn
-profile = "full64" # full64 | full128 | smoke | small_learning
+profile = "full128" # full64 | full128 | smoke | small_learning
 
 [paths]
 project_root = ".." # relative to this file; other paths relative to project_root
