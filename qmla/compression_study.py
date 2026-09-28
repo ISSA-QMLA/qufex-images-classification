@@ -164,6 +164,20 @@ class StudyInterrupted(KeyboardInterrupt):
     """Scheduler interruption: keep jobs resumable without consuming their budget."""
 
 
+def study_fingerprint(description):
+    data = json.loads(json.dumps(description))
+    data["experiment"]["training"].pop("device")
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def without_time_budgets(description):
+    data = json.loads(json.dumps(description))
+    data["experiment"]["training"].pop("device")
+    data["sweep"].pop("run_hours")
+    data["sweep"].pop("total_hours")
+    return data
+
+
 def is_oom(exc):
     return isinstance(exc, (MemoryError, require_torch().OutOfMemoryError)) or (
         isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower())
@@ -172,7 +186,8 @@ def is_oom(exc):
 class StudyRunner:
     """Single-process runner. State is committed at every budget checkpoint."""
 
-    def __init__(self, study: StudyConfig, root: Path | None = None, *, resume=False, read_only=False):
+    def __init__(self, study: StudyConfig, root: Path | None = None, *, resume=False, read_only=False,
+                 extend_budgets=False):
         study.validate()
         self.study = study
         self.root = (root or study.config.paths.runs_dir / f"compression_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}").resolve()
@@ -182,15 +197,19 @@ class StudyRunner:
         self.stop_requested = None
         description = study.description()
         # Device relocation is allowed and recorded per attempt; scientific settings are fixed.
-        fingerprint_data = json.loads(json.dumps(description))
-        fingerprint_data["experiment"]["training"].pop("device")
-        fingerprint = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True).encode()).hexdigest()
+        fingerprint = study_fingerprint(description)
         if self.state_path.exists():
             if not resume and not read_only:
                 raise ValueError("Study exists; pass --resume with --run-dir")
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if self.state["fingerprint"] != fingerprint:
-                raise ValueError("Study configuration differs; use its original configuration or start a new study")
+                if not (extend_budgets and resume and not read_only):
+                    raise ValueError("Study configuration differs; use its original configuration or start a new study")
+                self.extend_time_budgets(description, fingerprint)
+            elif extend_budgets:
+                # Repeating the same extension on a later allocation is harmless.
+                if not resume or read_only:
+                    raise ValueError("Budget extension requires a writable resume")
             if not read_only:
                 for group in ("jobs", "profiles", "evaluations"):
                     for row in self.state[group].values():
@@ -207,14 +226,61 @@ class StudyRunner:
                           "expansion_stopped": None, "dataset_id": None, "evaluation_manifest": None}
             self.root.mkdir(parents=True, exist_ok=True)
             study.config.save_resolved(self.root)
-            snapshot = study.config.resolved_dict() | {"sweep": asdict(study.sweep) | {
-                "levels": {name: asdict(level) for name, level in study.levels.items()}}}
-            (self.root / "resolved_sweep.toml").write_text(to_toml(snapshot), encoding="utf-8")
+            self.save_resolved_sweep()
         if not read_only:
             self.save()
 
     def save(self):
         atomic_json(self.state_path, self.state)
+
+    def save_resolved_sweep(self):
+        snapshot = self.study.config.resolved_dict() | {"sweep": asdict(self.study.sweep) | {
+            "levels": {name: asdict(level) for name, level in self.study.levels.items()}}}
+        target = self.root / "resolved_sweep.toml"
+        temporary = target.with_suffix(".toml.tmp")
+        temporary.write_text(to_toml(snapshot), encoding="utf-8")
+        temporary.replace(target)
+
+    def extend_time_budgets(self, description, fingerprint):
+        previous = self.state["configuration"]
+        if without_time_budgets(previous) != without_time_budgets(description):
+            raise ValueError("Only time budgets may change when extending a study")
+        if self.state.get("evaluation_manifest") is not None:
+            raise ValueError("Cannot extend exploration after test checkpoints were frozen")
+        old = previous["sweep"]
+        new = description["sweep"]
+        if new["run_hours"] < old["run_hours"] or new["total_hours"] < old["total_hours"]:
+            raise ValueError("Time budgets may only increase")
+        if new["run_hours"] == old["run_hours"] and new["total_hours"] == old["total_hours"]:
+            raise ValueError("Study configuration differs; no time budget increased")
+        if self.state["elapsed_seconds"] >= new["total_hours"] * 3600:
+            raise ValueError("New total budget is already exhausted")
+        for row in self.state["jobs"].values():
+            if row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
+                if row["elapsed_seconds"] < new["run_hours"] * 3600:
+                    checkpoint = self.study.config.paths.checkpoints_dir / Path(row["run_dir"]).name / "latest.pt"
+                    if not checkpoint.exists():
+                        raise ValueError(f"Cannot resume {row['key']}: latest.pt is missing")
+        self.state.setdefault("budget_extensions", []).append({
+            "at_utc": datetime.now().astimezone().isoformat(),
+            "from": {k: old[k] for k in ("run_hours", "total_hours")},
+            "to": {k: new[k] for k in ("run_hours", "total_hours")},
+            "elapsed_seconds_at_extension": self.state["elapsed_seconds"],
+        })
+        self.state["configuration"] = description
+        self.state["fingerprint"] = fingerprint
+        reopened = set()
+        for group in ("jobs", "profiles"):
+            for row in self.state[group].values():
+                if row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
+                    if row["elapsed_seconds"] < new["run_hours"] * 3600:
+                        row.update(status="interrupted", stopping_reason="time budget extended")
+                        reopened.add(row.get("level"))
+        stopped = self.state.get("expansion_stopped")
+        if stopped and stopped["reason"] == "budget_exhausted" and stopped["level"] in reopened:
+            self.state["expansion_stopped"] = None
+        self.save()
+        self.save_resolved_sweep()
 
     def request_stop(self, reason):
         # Signal handlers only set a flag; never interrupt checkpoint/JSON writes.

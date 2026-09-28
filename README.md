@@ -368,6 +368,28 @@ Edit these values directly in your HPC copy:
 original scientific settings and consumed budgets; it does not grant extra training time.
 A fresh launch against an existing study fails until you explicitly add `--resume`.
 
+For the study that completed its classical curve but capped the first M5 QuFeX run at four
+hours, merge the updated code on the HPC and reuse the **same bundle**. Set
+`config="$run_dir/resolved_sweep.toml"` in your HPC Slurm file and change the final command to:
+
+```bash
+exec .venv/bin/python -u -m scripts.compression_sweep \
+    --config "$config" --stage quantum --device cuda --run-dir "$run_dir" --resume \
+    --extend-run-hours 24 --extend-total-hours 144 \
+    --raw-dir /data/qmla/famato/data/raw \
+    --processed-dir /data/qmla/famato/data/processed \
+    --runs-dir "$bundle/runs" --checkpoints-dir "$bundle/checkpoints" \
+    --results-dir "$bundle/results"
+```
+
+The extension changes only time budgets, records the old and new limits in `study.json`,
+and refreshes `resolved_sweep.toml`. Completed classical jobs are reused. The capped
+QuFeX run resumes from `latest.pt`; its first four hours remain charged. The `quantum`
+stage also trains the patch-CNN controls needed for paired comparisons. Repeating these
+same flags on later Slurm allocations is safe; use `--resume` and the same bundle each time.
+The 50-hour Slurm allocation may need multiple submissions to reach the 144-hour study
+budget. If any scientific setting other than the two time limits changes, resume is rejected.
+
 The `exec .venv/bin/python` line replaces the batch shell with Python, allowing Slurm's
 five-minute warning signal to reach the existing checkpoint-aware handler directly.
 Exit code 75 means an interruption that can be resumed. Partial epochs replay from the last

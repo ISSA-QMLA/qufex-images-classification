@@ -252,6 +252,93 @@ def test_capped_job_is_never_restarted_and_has_no_selection(prepared, monkeypatc
     assert not restored.train("M0", "compression_cnn", 42)
 
 
+def test_extend_budgets_resumes_capped_quantum_without_retraining_completed_jobs(prepared):
+    study = study_for(prepared)
+    study = replace(study, config=replace(study.config,
+        training=replace(study.config.training, epochs=2)))
+    runner = StudyRunner(study, prepared.paths.runs_dir / "extend-quantum")
+    classical = runner.row("M1", "compression_cnn", 42)
+    classical.update(status="completed", macro_f1=0.8)
+    runner.state["selection"] = {"selected_level": "M1"}
+    original_control = runner.control
+
+    def cap_after_first_epoch(event, trainer):
+        if event == "epoch_complete" and len(trainer.history) == 1:
+            runner.active["elapsed_seconds"] = study.sweep.run_hours * 3600
+            runner.state["elapsed_seconds"] = study.sweep.run_hours * 3600
+        original_control(event, trainer)
+
+    runner.control = cap_after_first_epoch
+    assert not runner.train("M1", "compression_qufex", 42)
+    capped = runner.row("M1", "compression_qufex", 42)
+    assert capped["status"] == "budget_exhausted"
+    history = Path(capped["run_dir"]) / "history.json"
+    assert len(json.loads(history.read_text())) == 1
+    runner.state["expansion_stopped"] = {"level": "M1", "seed": 42, "reason": "budget_exhausted"}
+    runner.save()
+
+    extended = replace(study, sweep=replace(study.sweep, run_hours=6, total_hours=72))
+    with pytest.raises(ValueError, match="configuration differs"):
+        StudyRunner(extended, runner.root, resume=True)
+    changed_metric = replace(extended, sweep=replace(extended.sweep, max_macro_f1_drop=0.1))
+    with pytest.raises(ValueError, match="Only time budgets"):
+        StudyRunner(changed_metric, runner.root, resume=True, extend_budgets=True)
+    lowered = replace(study, sweep=replace(study.sweep, run_hours=3, total_hours=72))
+    with pytest.raises(ValueError, match="only increase"):
+        StudyRunner(lowered, runner.root, resume=True, extend_budgets=True)
+
+    resumed = StudyRunner(extended, runner.root, resume=True, extend_budgets=True)
+    assert resumed.state["expansion_stopped"] is None
+    assert resumed.state["jobs"][classical["key"]]["status"] == "completed"
+    assert resumed.state["jobs"][capped["key"]]["status"] == "interrupted"
+    assert resumed.state["selection"] == {"selected_level": "M1"}
+    assert len(resumed.state["budget_extensions"]) == 1
+    assert load_study(runner.root / "resolved_sweep.toml").sweep == extended.sweep
+    assert resumed.train("M1", "compression_qufex", 42)
+    completed = resumed.state["jobs"][capped["key"]]
+    assert completed["elapsed_seconds"] >= 4 * 3600
+    assert completed["epochs_completed"] == 2
+    assert len(json.loads(history.read_text())) == 2
+    assert len(completed["attempts"]) == 2
+    assert resumed.train("M1", "compression_cnn", 42)
+    assert resumed.state["jobs"][classical["key"]]["elapsed_seconds"] == 0
+    again = StudyRunner(extended, runner.root, resume=True, extend_budgets=True)
+    assert len(again.state["budget_extensions"]) == 1
+
+
+def test_cli_budget_extension_requires_resume_and_runs_quantum_only(prepared, monkeypatch):
+    from scripts import compression_sweep as cli
+    study = study_for(prepared)
+    monkeypatch.setattr(cli, "load_study", lambda *_a, **_k: study)
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, chosen, root, **options):
+            seen.update(run_hours=chosen.sweep.run_hours, total_hours=chosen.sweep.total_hours,
+                        root=root, options=options)
+            self.root = root
+            self.stop_requested = None
+
+        def request_stop(self, reason):
+            self.stop_requested = reason
+
+        def run(self, stage):
+            seen["stage"] = stage
+
+    monkeypatch.setattr(cli, "StudyRunner", FakeRunner)
+    arguments = ["compression_sweep", "--stage", "quantum", "--run-dir", str(prepared.paths.runs_dir / "prior"),
+                 "--extend-run-hours", "24", "--extend-total-hours", "144"]
+    monkeypatch.setattr("sys.argv", arguments)
+    with pytest.raises(SystemExit, match="2"):
+        cli.main()
+    monkeypatch.setattr("sys.argv", arguments + ["--resume"])
+    cli.main()
+    assert seen["stage"] == "quantum"
+    assert (seen["run_hours"], seen["total_hours"]) == (24, 144)
+    assert seen["options"]["extend_budgets"] is True
+    assert seen["options"]["resume"] is True
+
+
 @pytest.mark.parametrize("stage", ["classical", "quantum"])
 def test_scheduler_stop_is_resumable_and_does_not_stop_expansion(prepared, monkeypatch, stage):
     study = study_for(prepared)
