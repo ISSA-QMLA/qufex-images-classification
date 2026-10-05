@@ -240,7 +240,8 @@ The independent [`configs/compression_sweep.toml`](configs/compression_sweep.tom
 [`scripts/compression_sweep.py`](scripts/compression_sweep.py). It does not inherit settings
 from `experiments.toml`. Its defaults are full 64×64 images, seeds **42, 1324, 987654**,
 50 epochs with patience 8, and a **0.05 absolute** acceptable drop in mean paired validation
-macro-F1 relative to M0. For example, a change from 0.90 to 0.85 is acceptable.
+macro-F1 relative to the first configured level (K1 by default; M0 in the original study).
+For example, a change from 0.90 to 0.85 is acceptable.
 
 ```bash
 # Inspect the resolved experiment and resource counts without preparing data or training
@@ -270,6 +271,8 @@ original study; changing the device is allowed and each attempt records its hard
 
 | Level | C×H×W | Feature values | Forward circuit instances/image |
 |---|---:|---:|---:|
+| K1 | 64×32×32 | 65536 | 8192 |
+| K0 | 64×16×16 | 16384 | 2048 |
 | M0 | 64×8×8 | 4096 | 512 |
 | M1 | 64×6×6 | 2304 | 288 |
 | M2 | 64×4×4 | 1024 | 128 |
@@ -277,7 +280,14 @@ original study; changing the device is allowed and each attempt records its hard
 | M4 | 32×2×2 | 128 | 16 |
 | M5 | 16×2×2 | 64 | 8 |
 
-M0–M3 vary spatial compression; M4–M5 additionally reduce channels. Each model uses the direct
+The ordered schedule is **K1 → K0 → M0 → M1 → M2 → M3 → M4 → M5**. K1 is the
+least-compressed baseline for the 0.05 paired macro-F1 threshold. K0 pools after the first
+two encoder blocks; K1 pools after only the first block. Both keep all three convolutions
+with widths `[16, 32, 64]` and create their larger maps directly, without upsampling.
+This changes the encoder's spatial downsampling and receptive field, so K1/K0 comparisons
+measure the effect of retaining spatial detail through the encoder as well as extraction size.
+`pool_blocks = -1` (the default) retains pooling after every block, preserving M0–M5
+and the direct-CNN reference. M0–M3 vary spatial compression; M4–M5 additionally reduce channels. Each model uses the direct
 CNN encoder, an optional channel projection and adaptive average pooling, a residual extraction
 module, global pooling and the classifier. The full CNN extraction module mixes all channels;
 the patch CNN and quantum module operate on identical nonoverlapping 2×2 patches of adjacent
@@ -388,7 +398,41 @@ QuFeX run resumes from `latest.pt`; its first four hours remain charged. The `qu
 stage also trains the patch-CNN controls needed for paired comparisons. Repeating these
 same flags on later Slurm allocations is safe; use `--resume` and the same bundle each time.
 The 50-hour Slurm allocation may need multiple submissions to reach the 144-hour study
-budget. If any scientific setting other than the two time limits changes, resume is rejected.
+budget. Other scientific changes require a new study, except for the explicit level extension below.
+
+To add K0/K1 to an existing HPC study while reusing completed M-level and reference runs,
+keep your existing HPC sweep configuration and insert these tables **before** `[sweep.levels.M0]`:
+
+```toml
+[sweep.levels.K1]
+channels = 64
+spatial_size = 32
+pool_blocks = 1
+
+[sweep.levels.K0]
+channels = 64
+spatial_size = 16
+pool_blocks = 2
+```
+
+Use that edited configuration in your manually maintained Slurm file. Keep the same bundle
+and path overrides, and change the Python arguments to:
+
+```bash
+--config "$config" --stage classical --device cuda --run-dir "$run_dir" --resume --extend-levels
+```
+
+Only the new K-level classical runs are trained. The previous selection is archived in
+`study.json`, and a new selection is computed relative to K1 after all classical seeds complete.
+Existing jobs, checkpoints, profiles and consumed runtime are retained. Adding levels does
+not increase time budgets or reopen capped quantum jobs. If more time is needed, also pass
+`--extend-run-hours 24 --extend-total-hours 144` (or higher limits than already saved).
+`--stage all` can extend levels and then continue quantum exploration in one invocation.
+Only prepending levels is allowed; changing existing levels or extending a study after its
+test checkpoint list was frozen is rejected. Repeating the extension flags is harmless.
+For later resumes, use the updated `$run_dir/resolved_sweep.toml` and `--resume`.
+Quantum expansion proceeds toward M0, K0, K1 as budgets permit; K0/K1 still use the fixed
+eight-qubit circuit but require respectively 4× and 16× as many circuit instances as M0.
 
 The `exec .venv/bin/python` line replaces the batch shell with Python, allowing Slurm's
 five-minute warning signal to reach the existing checkpoint-aware handler directly.

@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--stage", choices=("prepare", "classical", "profile", "quantum", "analyze", "evaluate", "all"), default="all")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--extend-levels", action="store_true", help="Prepend less-compressed levels to an existing study")
     parser.add_argument("--extend-run-hours", type=float, help="Raise the per-run limit when resuming a study")
     parser.add_argument("--extend-total-hours", type=float, help="Raise the accumulated study limit when resuming")
     parser.add_argument("--device")
@@ -25,6 +26,8 @@ def main():
     args = parser.parse_args()
     try:
         extending = args.extend_run_hours is not None or args.extend_total_hours is not None
+        if args.extend_levels and (not args.resume or args.run_dir is None or args.stage not in {"classical", "all"}):
+            raise ValueError("Level extension requires --resume, --run-dir, and --stage classical or all")
         if extending and (not args.resume or args.run_dir is None or args.stage in {"prepare", "analyze", "evaluate"}):
             raise ValueError("Budget extension requires --resume, --run-dir, and an exploration stage")
         study = load_study(args.config, device=args.device, paths=path_overrides(args))
@@ -52,7 +55,7 @@ def main():
             raise ValueError(f"--stage {args.stage} requires an existing --run-dir")
         directory = resolve_job_path(args.run_dir, study.config)
         runner = StudyRunner(study, directory, resume=args.resume, read_only=args.stage == "analyze",
-                             extend_budgets=extending)
+                             extend_budgets=extending, extend_levels=args.extend_levels)
         previous = {}
         def request_stop(signum, _frame):
             runner.request_stop(signal.Signals(signum).name)

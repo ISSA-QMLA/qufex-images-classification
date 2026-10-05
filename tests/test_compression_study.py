@@ -39,7 +39,8 @@ def test_standalone_defaults_and_validation(tiny_config):
     assert study.config.training.seeds == (42, 1324, 987654)
     assert study.config.data.image_size == 64
     assert study.sweep.max_macro_f1_drop == 0.05
-    assert [l.values // 8 for l in study.levels.values()] == [512, 288, 128, 32, 16, 8]
+    assert list(study.levels) == ["K1", "K0", "M0", "M1", "M2", "M3", "M4", "M5"]
+    assert [l.values // 8 for l in study.levels.values()] == [8192, 2048, 512, 288, 128, 32, 16, 8]
     assert MODELS == ("qufex", "cnn_replacement", "direct_cnn")
     for levels in ({"M0": Level(3, 4)}, {"M0": Level(4, 3)},
                    {"M0": Level(4, 100)}, {"M0": Level(4, 2), "M1": Level(4, 4)}):
@@ -62,6 +63,150 @@ def test_selection_threshold_nonmonotonic_and_missing_seeds(tiny_config):
     assert choose_level(study, rows) is None
     assert quantum_order(study, "M1") == ["M1", "M2", "M0"]
     assert quantum_order(study, "M2") == ["M2", "M1", "M0"]
+
+
+def test_larger_levels_use_fewer_pools_and_preserve_old_architectures():
+    study = load_study(Path(__file__).parents[1] / "configs/compression_sweep.toml", device="cpu")
+    torch.set_num_threads(2)
+    for name, size, depth in (("K1", 32, 1), ("K0", 16, 2), ("M0", 8, 3)):
+        config = study.for_run(name, "compression_cnn", 42)
+        model = GalaxyClassifier(config).eval()
+        x = torch.randn(2, 3, 64, 64)
+        with torch.no_grad():
+            encoded = model.encoder(x)
+            assert encoded.shape == (2, 64, size, size)
+            assert model.compression(encoded).shape == encoded.shape
+            assert model(x).shape == (2, 3)
+        assert sum(isinstance(m, torch.nn.MaxPool2d) for m in model.encoder.modules()) == depth
+        assert sum(isinstance(m, torch.nn.Conv2d) for m in model.encoder.modules()) == 3
+        paired = GalaxyClassifier(study.for_run(name, "compression_qufex", 42))
+        for module in ("encoder", "compression", "classifier"):
+            for key, value in getattr(model, module).state_dict().items():
+                assert torch.equal(value, getattr(paired, module).state_dict()[key])
+    reference = GalaxyClassifier(study.for_run("reference", "direct_cnn", 42))
+    assert reference.encoder(x).shape == (2, 64, 8, 8)
+    assert study.for_run("M0", "compression_cnn", 42).architecture.pool_blocks == -1
+    with pytest.raises(ConfigError, match="upsample"):
+        replace(study, levels={"K0": Level(64, 16)}).validate()
+    for invalid in (-2, 4, 1.5, True):
+        with pytest.raises(ConfigError, match="pool_blocks"):
+            replace(study, levels={"K0": Level(64, 16, invalid)}).validate()
+
+
+def test_prepend_levels_reuses_runs_and_reselects_against_k1(prepared):
+    study = study_for(prepared)
+    runner = StudyRunner(study, prepared.paths.runs_dir / "prepend")
+    runner.run("classical")
+    previous_selection = runner.state["selection"]
+    old_jobs = json.loads(json.dumps(runner.state["jobs"]))
+    elapsed = runner.state["elapsed_seconds"]
+    extended = replace(study, levels={"K1": Level(4, 16, 1), "K0": Level(4, 8, 2), **study.levels})
+    with pytest.raises(ValueError, match="configuration differs"):
+        StudyRunner(extended, runner.root, resume=True)
+    resumed = StudyRunner(extended, runner.root, resume=True, extend_levels=True)
+    assert resumed.state["jobs"] == old_jobs
+    assert resumed.state["elapsed_seconds"] == elapsed
+    assert resumed.state["selection"] is None
+    assert json.loads((runner.root / "selection.json").read_text()) is None
+    assert resumed.state["level_extensions"][0]["previous_selection"] == previous_selection
+    with pytest.raises(ValueError, match="every classical"):
+        resumed.quantum()
+    resumed.run("classical")
+    assert resumed.state["selection"]["reference_level"] == "K1"
+    for key, record in old_jobs.items():
+        assert resumed.state["jobs"][key] == record
+    assert len(resumed.state["jobs"]) == len(old_jobs) + 2
+    assert quantum_order(extended, "M1") == ["M1", "M0", "K0", "K1"]
+    config = load_checkpoint_config(Path(resumed.row("K1", "compression_cnn", 42)["checkpoint"]))
+    assert config.architecture.pool_blocks == 1
+    assert config.architecture.quantum_spatial_size == 16
+    assert load_study(runner.root / "resolved_sweep.toml").description() == extended.description()
+    again = StudyRunner(extended, runner.root, resume=True, extend_levels=True)
+    assert len(again.state["level_extensions"]) == 1
+    assert again.state["selection"] == resumed.state["selection"]
+
+
+def test_level_extension_rejects_changes_and_frozen_studies(prepared):
+    study = study_for(prepared)
+    runner = StudyRunner(study, prepared.paths.runs_dir / "invalid-prepend")
+    original = json.loads(runner.state_path.read_text())["configuration"]
+    extended = replace(study, levels={"K0": Level(4, 8, 2), **study.levels})
+    for levels in ({"K0": Level(4, 8, 2), "M0": Level(4, 4)},
+                   {"K0": Level(4, 8, 2), "M0": Level(4, 4, 2), "M1": Level(4, 2)}):
+        with pytest.raises(ValueError, match="only prepend"):
+            StudyRunner(replace(study, levels=levels), runner.root, resume=True, extend_levels=True)
+    changed = replace(extended, sweep=replace(study.sweep, max_macro_f1_drop=0.1))
+    with pytest.raises(ValueError, match="Only time budgets"):
+        StudyRunner(changed, runner.root, resume=True, extend_levels=True)
+    changed_budget = replace(extended, sweep=replace(study.sweep, total_hours=72))
+    with pytest.raises(ValueError, match="explicit budget extension"):
+        StudyRunner(changed_budget, runner.root, resume=True, extend_levels=True)
+    assert json.loads(runner.state_path.read_text())["configuration"] == original
+    runner.state["evaluation_manifest"] = []
+    runner.save()
+    with pytest.raises(ValueError, match="frozen"):
+        StudyRunner(extended, runner.root, resume=True, extend_levels=True)
+
+
+def test_legacy_study_fingerprint_ignores_default_pooling_field(prepared):
+    import hashlib
+    study = study_for(prepared)
+    runner = StudyRunner(study, prepared.paths.runs_dir / "old-fingerprint")
+    description = runner.state["configuration"]
+    for arch in description["experiment"]["architectures"].values():
+        arch.pop("pool_blocks", None)
+    for level in description["levels"].values():
+        level.pop("pool_blocks")
+    payload = json.loads(json.dumps(description))
+    payload["experiment"]["training"].pop("device")
+    runner.state["fingerprint"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    runner.save()
+    assert StudyRunner(study, runner.root, resume=True).state["id"] == runner.state["id"]
+
+
+def test_combined_level_and_budget_extension_keeps_expansion_stop_without_reopening(tiny_config):
+    study = study_for(tiny_config)
+    runner = StudyRunner(study, tiny_config.paths.runs_dir / "combined-extension")
+    runner.state["elapsed_seconds"] = 30
+    runner.state["selection"] = {"selected_level": "M1", "reference_scores": [0.8]}
+    runner.state["expansion_stopped"] = {"level": "M1", "reason": "oom"}
+    runner.save()
+    extended = replace(study, levels={"K0": Level(4, 8, 2), **study.levels},
+                       sweep=replace(study.sweep, run_hours=24, total_hours=144))
+    resumed = StudyRunner(extended, runner.root, resume=True, extend_levels=True, extend_budgets=True)
+    assert resumed.state["elapsed_seconds"] == 30
+    assert resumed.state["expansion_stopped"] == runner.state["expansion_stopped"]
+    assert resumed.state["selection"] is None
+    assert len(resumed.state["level_extensions"]) == len(resumed.state["budget_extensions"]) == 1
+
+
+def test_cli_level_extension_requires_classical_resume(prepared, monkeypatch):
+    from scripts import compression_sweep as cli
+    study = study_for(prepared)
+    monkeypatch.setattr(cli, "load_study", lambda *_a, **_k: study)
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, chosen, root, **options):
+            seen.update(options)
+            self.root, self.stop_requested = root, None
+
+        def run(self, stage):
+            seen["stage"] = stage
+
+        def request_stop(self, reason):
+            self.stop_requested = reason
+
+    monkeypatch.setattr(cli, "StudyRunner", FakeRunner)
+    base = ["compression_sweep", "--run-dir", str(prepared.paths.runs_dir / "prior"), "--extend-levels"]
+    for extra in (["--stage", "classical"], ["--stage", "quantum", "--resume"]):
+        monkeypatch.setattr("sys.argv", base + extra)
+        with pytest.raises(SystemExit, match="2"):
+            cli.main()
+    monkeypatch.setattr("sys.argv", base + ["--stage", "classical", "--resume"])
+    cli.main()
+    assert seen["stage"] == "classical"
+    assert seen["resume"] and seen["extend_levels"]
 
 
 def test_patch_order_and_legacy_quantum_equivalence():
@@ -386,6 +531,7 @@ def test_old_format2_compression_defaults_remain_loadable(prepared):
     checkpoint["config"]["training"].pop("paired_randomness")
     for name in ("shared", "direct"):
         checkpoint["config"]["architectures"][name].pop("circuit_chunk_size")
+        checkpoint["config"]["architectures"][name].pop("pool_blocks")
     torch.save(checkpoint, best)
     restored = load_checkpoint_config(best)
     model = GalaxyClassifier(restored)

@@ -81,6 +81,15 @@ circuit_chunk_size = 256
 include_more_compressed = true
 
 # Ordered least -> most compressed. Spatial sizes must be even; no upsampling.
+# Keep all three convolutional blocks, pooling only after the first N blocks.
+[sweep.levels.K1]
+channels = 64
+spatial_size = 32
+pool_blocks = 1
+[sweep.levels.K0]
+channels = 64
+spatial_size = 16
+pool_blocks = 2
 [sweep.levels.M0]
 channels = 64
 spatial_size = 8

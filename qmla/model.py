@@ -290,13 +290,14 @@ class GalaxyClassifier(nn.Module):
 
         encoder: list[nn.Module] = []
         current_channels = 3
-        for channels in arch.encoder_channels:
+        for index, channels in enumerate(arch.encoder_channels):
             encoder.append(
                 ConvBlock(
                     current_channels,
                     channels,
                     arch.convolutions_per_block,
-                    pool=arch.pooling, pool_size=arch.pool_size, kernel_size=arch.kernel_size,
+                    pool=arch.pooling if index < arch.pooling_depth else "none",
+                    pool_size=arch.pool_size, kernel_size=arch.kernel_size,
                     norm=arch.normalization, act=arch.activation,
                 )
             )

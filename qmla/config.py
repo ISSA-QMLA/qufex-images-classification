@@ -58,6 +58,7 @@ class ArchitectureConfig:
     kernel_size: int = 3
     pooling: str = "max"
     pool_size: int = 2
+    pool_blocks: int = -1  # -1 pools every encoder block; otherwise pool the first N.
     normalization: str = "batch"
     activation: str = "relu"
     compression_channels: int = 16
@@ -69,6 +70,15 @@ class ArchitectureConfig:
     classifier_hidden_neurons: tuple[int, ...] = (32,)
     dropout: float = 0.2
     circuit_chunk_size: int = 256
+
+    @property
+    def pooling_depth(self) -> int:
+        if self.pooling == "none":
+            return 0
+        return len(self.encoder_channels) if self.pool_blocks == -1 else self.pool_blocks
+
+    def encoder_spatial_size(self, image_size: int) -> int:
+        return image_size // self.pool_size**self.pooling_depth
 
 
 @dataclass(frozen=True)
@@ -291,10 +301,12 @@ class AppConfig:
                 raise ConfigError(f"architectures.{label}: unsupported pooling/projection")
             if not 0 <= arch.dropout < 1 or min(arch.pool_size, arch.convolutions_per_block, arch.post_convolutions) < 1:
                 raise ConfigError(f"architectures.{label}: invalid dropout/pooling/repetitions")
+            if type(arch.pool_blocks) is not int or not -1 <= arch.pool_blocks <= len(arch.encoder_channels):
+                raise ConfigError(f"architectures.{label}: pool_blocks must be -1 or between zero and the encoder depth")
             if any(k < 1 or k % 2 == 0 for k in (arch.kernel_size, arch.post_kernel_size)):
                 raise ConfigError("Convolution kernels must be positive odd integers")
         arch = self.architecture
-        spatial = self.data.image_size // (arch.pool_size ** len(arch.encoder_channels) if arch.pooling != "none" else 1)
+        spatial = arch.encoder_spatial_size(self.data.image_size)
         if spatial < 1:
             raise ConfigError("image_size is too small for the encoder pooling depth")
         rep = self.architectures.replacement

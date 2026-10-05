@@ -27,6 +27,7 @@ from qmla.utils import require_torch
 class Level:
     channels: int = 64
     spatial_size: int = 8
+    pool_blocks: int = -1
 
     @property
     def values(self):
@@ -56,7 +57,8 @@ class StudyConfig:
             return config.for_model(variant, seed)
         shape = self.levels[level]
         arch = replace(config.architectures.direct, compression_channels=shape.channels,
-                       quantum_spatial_size=shape.spatial_size, circuit_chunk_size=self.sweep.circuit_chunk_size)
+                       quantum_spatial_size=shape.spatial_size, circuit_chunk_size=self.sweep.circuit_chunk_size,
+                       pool_blocks=shape.pool_blocks if shape.pool_blocks != -1 else config.architectures.direct.pool_blocks)
         config = replace(config, architectures=replace(config.architectures, shared=arch))
         return config.for_model(variant, seed)
 
@@ -164,15 +166,26 @@ class StudyInterrupted(KeyboardInterrupt):
     """Scheduler interruption: keep jobs resumable without consuming their budget."""
 
 
-def study_fingerprint(description):
+def canonical_description(description):
+    """Omitted pooling controls in existing studies mean all encoder blocks."""
     data = json.loads(json.dumps(description))
     data["experiment"]["training"].pop("device")
+    for arch in data["experiment"]["architectures"].values():
+        if arch.get("pool_blocks") == -1:
+            arch.pop("pool_blocks")
+    for level in data["levels"].values():
+        if level.get("pool_blocks") == -1:
+            level.pop("pool_blocks")
+    return data
+
+
+def study_fingerprint(description):
+    data = canonical_description(description)
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
 def without_time_budgets(description):
-    data = json.loads(json.dumps(description))
-    data["experiment"]["training"].pop("device")
+    data = canonical_description(description)
     data["sweep"].pop("run_hours")
     data["sweep"].pop("total_hours")
     return data
@@ -187,7 +200,7 @@ class StudyRunner:
     """Single-process runner. State is committed at every budget checkpoint."""
 
     def __init__(self, study: StudyConfig, root: Path | None = None, *, resume=False, read_only=False,
-                 extend_budgets=False):
+                 extend_budgets=False, extend_levels=False):
         study.validate()
         self.study = study
         self.root = (root or study.config.paths.runs_dir / f"compression_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}").resolve()
@@ -203,19 +216,21 @@ class StudyRunner:
                 raise ValueError("Study exists; pass --resume with --run-dir")
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if self.state["fingerprint"] != fingerprint:
-                if not (extend_budgets and resume and not read_only):
+                if not ((extend_budgets or extend_levels) and resume and not read_only):
                     raise ValueError("Study configuration differs; use its original configuration or start a new study")
-                self.extend_time_budgets(description, fingerprint)
-            elif extend_budgets:
+                self.extend_study(description, fingerprint, extend_budgets=extend_budgets, extend_levels=extend_levels)
+            elif extend_budgets or extend_levels:
                 # Repeating the same extension on a later allocation is harmless.
                 if not resume or read_only:
-                    raise ValueError("Budget extension requires a writable resume")
+                    raise ValueError("Study extension requires a writable resume")
             if not read_only:
                 for group in ("jobs", "profiles", "evaluations"):
                     for row in self.state[group].values():
                         if row["status"] == "running":
                             row.update(status="interrupted", stopping_reason="previous invocation interrupted")
         else:
+            if extend_budgets or extend_levels:
+                raise ValueError("Study extension requires an existing study")
             if resume or read_only:
                 raise ValueError("No existing study.json in --run-dir")
             if self.root.exists() and any(self.root.iterdir()):
@@ -241,38 +256,62 @@ class StudyRunner:
         temporary.write_text(to_toml(snapshot), encoding="utf-8")
         temporary.replace(target)
 
-    def extend_time_budgets(self, description, fingerprint):
+    def extend_study(self, description, fingerprint, *, extend_budgets, extend_levels):
         previous = self.state["configuration"]
-        if without_time_budgets(previous) != without_time_budgets(description):
+        before = without_time_budgets(previous)
+        after = without_time_budgets(description)
+        old_names = list(previous["levels"])
+        new_names = list(description["levels"])
+        added = new_names[:len(new_names) - len(old_names)] if len(new_names) > len(old_names) else []
+        if extend_levels:
+            if new_names != [*added, *old_names] or any(
+                after["levels"].get(name) != before["levels"][name] for name in old_names
+            ):
+                raise ValueError("Level extension may only prepend levels; existing levels and their order must stay unchanged")
+            # All other scientific settings must still match, including paths and seeds.
+            after["levels"] = before["levels"]
+        if before != after:
             raise ValueError("Only time budgets may change when extending a study")
         if self.state.get("evaluation_manifest") is not None:
             raise ValueError("Cannot extend exploration after test checkpoints were frozen")
         old = previous["sweep"]
         new = description["sweep"]
+        budgets_changed = any(new[k] != old[k] for k in ("run_hours", "total_hours"))
+        if budgets_changed and not extend_budgets:
+            raise ValueError("Changing time budgets also requires explicit budget extension")
         if new["run_hours"] < old["run_hours"] or new["total_hours"] < old["total_hours"]:
             raise ValueError("Time budgets may only increase")
-        if new["run_hours"] == old["run_hours"] and new["total_hours"] == old["total_hours"]:
-            raise ValueError("Study configuration differs; no time budget increased")
-        if self.state["elapsed_seconds"] >= new["total_hours"] * 3600:
+        if not budgets_changed and not added:
+            raise ValueError("Study configuration differs; no levels or time budgets added")
+        if budgets_changed and self.state["elapsed_seconds"] >= new["total_hours"] * 3600:
             raise ValueError("New total budget is already exhausted")
         for row in self.state["jobs"].values():
-            if row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
+            if budgets_changed and row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
                 if row["elapsed_seconds"] < new["run_hours"] * 3600:
                     checkpoint = self.study.config.paths.checkpoints_dir / Path(row["run_dir"]).name / "latest.pt"
                     if not checkpoint.exists():
                         raise ValueError(f"Cannot resume {row['key']}: latest.pt is missing")
-        self.state.setdefault("budget_extensions", []).append({
-            "at_utc": datetime.now().astimezone().isoformat(),
-            "from": {k: old[k] for k in ("run_hours", "total_hours")},
-            "to": {k: new[k] for k in ("run_hours", "total_hours")},
-            "elapsed_seconds_at_extension": self.state["elapsed_seconds"],
-        })
+        if budgets_changed:
+            self.state.setdefault("budget_extensions", []).append({
+                "at_utc": datetime.now().astimezone().isoformat(),
+                "from": {k: old[k] for k in ("run_hours", "total_hours")},
+                "to": {k: new[k] for k in ("run_hours", "total_hours")},
+                "elapsed_seconds_at_extension": self.state["elapsed_seconds"],
+            })
+        if added:
+            self.state.setdefault("level_extensions", []).append({
+                "at_utc": datetime.now().astimezone().isoformat(), "added_levels": added,
+                "previous_selection": self.state["selection"],
+                "elapsed_seconds_at_extension": self.state["elapsed_seconds"],
+            })
+            self.state["selection"] = None
+            atomic_json(self.root / "selection.json", None)
         self.state["configuration"] = description
         self.state["fingerprint"] = fingerprint
         reopened = set()
         for group in ("jobs", "profiles"):
             for row in self.state[group].values():
-                if row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
+                if budgets_changed and row["status"] == "budget_exhausted" and row["stopping_reason"] in {"run_time_limit", "study_time_limit"}:
                     if row["elapsed_seconds"] < new["run_hours"] * 3600:
                         row.update(status="interrupted", stopping_reason="time budget extended")
                         reopened.add(row.get("level"))
@@ -326,14 +365,14 @@ class StudyRunner:
         if key not in self.state["jobs"]:
             shape = self.study.levels.get(level)
             arch = self.study.config.architectures.direct
-            reference_spatial = self.study.config.data.image_size // (
-                arch.pool_size ** len(arch.encoder_channels) if arch.pooling != "none" else 1)
+            reference_spatial = arch.encoder_spatial_size(self.study.config.data.image_size)
             actual_shape = shape or Level(arch.encoder_channels[-1], reference_spatial)
             self.state["jobs"][key] = {"key": key, "level": level, "variant": variant, "seed": seed,
                 "status": "pending", "stopping_reason": None, "elapsed_seconds": 0.0, "attempts": [],
                 "channels": actual_shape.channels, "spatial_size": actual_shape.spatial_size,
                 "height": actual_shape.spatial_size, "width": actual_shape.spatial_size,
                 "feature_values": actual_shape.values,
+                "encoder_pool_blocks": self.study.for_run(level, variant, seed).architecture.pooling_depth,
                 "compression_axis": ("spatial" if shape.channels == next(iter(self.study.levels.values())).channels else "channel") if shape else "reference",
                 "circuit_instances_per_image": shape.values // 8 if variant == "compression_qufex" else 0,
                 "qubits": 8 if variant == "compression_qufex" else 0,
