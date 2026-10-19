@@ -155,6 +155,7 @@ def test_legacy_study_fingerprint_ignores_default_pooling_field(prepared):
     description = runner.state["configuration"]
     for arch in description["experiment"]["architectures"].values():
         arch.pop("pool_blocks", None)
+    description["experiment"]["data"].pop("dataset", None)
     for level in description["levels"].values():
         level.pop("pool_blocks")
     payload = json.loads(json.dumps(description))

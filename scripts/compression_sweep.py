@@ -7,7 +7,7 @@ from pathlib import Path
 
 from qmla.cli import PATH_OPTIONS, path_overrides, resolve_job_path
 from qmla.compression_study import StudyRunner, load_study
-from qmla.data import GalaxyZooPreprocessor, validate_cache
+from qmla.data import DermaMNISTPreprocessor, GalaxyZooPreprocessor, validate_cache
 
 
 def main():
@@ -44,7 +44,7 @@ def main():
             if args.run_dir is not None or args.resume:
                 raise ValueError("--stage prepare only prepares data; omit --run-dir and --resume")
             if not study.config.cache_dir.exists():
-                GalaxyZooPreprocessor(study.config).run()
+                (DermaMNISTPreprocessor if study.config.data.dataset == "dermamnist" else GalaxyZooPreprocessor)(study.config).run()
             metadata = validate_cache(study.config)
             print(f"Prepared cache: {study.config.cache_dir}")
             print(f"Dataset identity: {metadata['dataset_id']}")

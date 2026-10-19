@@ -1,11 +1,11 @@
-"""Download, verify, and extract the official Galaxy Zoo 2 data products."""
+"""Download and verify the configured dataset's official source files."""
 
 from __future__ import annotations
 
 import argparse
 
 from qmla.config import ConfigError
-from qmla.data import GalaxyZooDownloader
+from qmla.data import GalaxyZooDownloader, download_dermamnist
 from qmla.cli import add_config_arguments, resolve_config
 
 
@@ -25,7 +25,13 @@ def main() -> None:
     args = parser.parse_args()
     try:
         config = resolve_config(args)
-        GalaxyZooDownloader(config.paths.raw_dir).run(extract_images=not args.no_extract)
+        if config.data.dataset == "dermamnist":
+            if args.no_extract:
+                raise ValueError("--no-extract applies only to Galaxy Zoo")
+            source = download_dermamnist(config.paths.raw_dir)
+            print(f"Verified DermaMNIST archive: {source}")
+        else:
+            GalaxyZooDownloader(config.paths.raw_dir).run(extract_images=not args.no_extract)
     except (ConfigError, OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 

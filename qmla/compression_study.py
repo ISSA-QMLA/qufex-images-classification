@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from qmla.config import AppConfig, ConfigError, _check_keys, _section, config_from_dict, relocate_paths, to_toml
-from qmla.data import GalaxyZooPreprocessor, validate_cache
+from qmla.data import DermaMNISTPreprocessor, GalaxyZooPreprocessor, validate_cache
 from qmla.engine import Evaluator, Trainer, load_checkpoint_config
 from qmla.runtime import RuntimeMonitor
 from qmla.utils import require_torch
@@ -170,6 +170,8 @@ def canonical_description(description):
     """Omitted pooling controls in existing studies mean all encoder blocks."""
     data = json.loads(json.dumps(description))
     data["experiment"]["training"].pop("device")
+    if data["experiment"]["data"].get("dataset") == "galaxy_zoo":
+        data["experiment"]["data"].pop("dataset")
     for arch in data["experiment"]["architectures"].values():
         if arch.get("pool_blocks") == -1:
             arch.pop("pool_blocks")
@@ -352,7 +354,7 @@ class StudyRunner:
         started = time.perf_counter()
         config = self.study.config
         if not config.cache_dir.exists():
-            GalaxyZooPreprocessor(config).run()
+            (DermaMNISTPreprocessor if config.data.dataset == "dermamnist" else GalaxyZooPreprocessor)(config).run()
         metadata = validate_cache(config)
         if self.state["dataset_id"] not in (None, metadata["dataset_id"]):
             raise RuntimeError("Study dataset identity changed")

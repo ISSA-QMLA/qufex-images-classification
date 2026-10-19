@@ -52,6 +52,12 @@ RESOURCES = (
     ),
 )
 
+DERMAMNIST_RESOURCE = RemoteResource(
+    "dermamnist_64.npz",
+    "https://zenodo.org/records/10519652/files/dermamnist_64.npz?download=1",
+    "b70a2f5635c6199aeaa28c31d7202e1f",
+)
+
 
 def file_digest(path: Path, algorithm: str = "sha256", chunk_size: int = 8 * 1024 * 1024) -> str:
     digest = hashlib.new(algorithm)
@@ -168,6 +174,12 @@ class GalaxyZooDownloader:
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
         return manifest
+
+
+def download_dermamnist(raw_dir: Path) -> Path:
+    """Download or reuse the checksum-verified MedMNIST+ 64×64 archive."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    return GalaxyZooDownloader(raw_dir)._download(DERMAMNIST_RESOURCE)
 
 
 LABEL_COLUMNS = {
@@ -375,6 +387,96 @@ class GalaxyZooPreprocessor:
         return metadata
 
 
+class DermaMNISTPreprocessor(GalaxyZooPreprocessor):
+    """Convert the official MedMNIST+ 64×64 splits into the existing cache format."""
+
+    def _write_official_split(self, name: str, images: np.ndarray, labels: np.ndarray):
+        size = self.config.data.image_size
+        if images.ndim != 4 or images.shape[1:] != (size, size, 3) or images.dtype != np.uint8:
+            raise ValueError(f"Invalid official DermaMNIST {name} image shape or dtype")
+        if labels.shape != (len(images), 1) or not np.issubdtype(labels.dtype, np.integer):
+            raise ValueError(f"Invalid official DermaMNIST {name} labels")
+        flat = labels[:, 0].astype(np.int64)
+        if set(np.unique(flat)) != set(range(len(self.config.evaluation.class_names))):
+            raise ValueError(f"Official DermaMNIST {name} split is missing or has unexpected classes")
+        frame = pd.DataFrame({"source_index": np.arange(len(images)), "label": flat})
+        selected = self._subset(frame, getattr(self.config.data, f"{name}_limit"))
+        chosen = selected["source_index"].to_numpy(dtype=np.int64)
+        identifiers = [f"dermamnist-{name}-{index}" for index in chosen]
+        output_images = np.lib.format.open_memmap(
+            self.output_dir / f"{name}_images.npy", mode="w+", dtype=np.uint8,
+            shape=(len(chosen), size, size, 3))
+        output_labels = np.lib.format.open_memmap(
+            self.output_dir / f"{name}_labels.npy", mode="w+", dtype=np.int64,
+            shape=(len(chosen),))
+        for start in range(0, len(chosen), self.config.data.preprocessing_batch_size):
+            stop = start + self.config.data.preprocessing_batch_size
+            output_images[start:stop] = images[chosen[start:stop]]
+            output_labels[start:stop] = flat[chosen[start:stop]]
+        output_images.flush()
+        output_labels.flush()
+        pd.DataFrame({"dr7objid": identifiers, "source_index": chosen,
+                      "label": flat[chosen]}).to_csv(self.output_dir / f"{name}_manifest.csv", index=False)
+        return output_images, output_labels, identifiers
+
+    def run(self) -> dict[str, Any]:
+        destination = self.config.cache_dir
+        if destination.exists():
+            return validate_cache(self.config)
+        source = download_dermamnist(self.raw_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.output_dir = destination.parent / f".{destination.name}.building-{uuid.uuid4().hex}"
+        self.output_dir.mkdir()
+        arrays = {}
+        master_ids = {}
+        split_ids = {}
+        with np.load(source, allow_pickle=False) as archive:
+            required = {f"{split}_{kind}" for split in ("train", "val", "test")
+                        for kind in ("images", "labels")}
+            if not required.issubset(archive.files):
+                raise ValueError(f"Official DermaMNIST archive is missing {sorted(required - set(archive.files))}")
+            for name, official in (("train", "train"), ("validation", "val"), ("test", "test")):
+                images = archive[f"{official}_images"]
+                labels = archive[f"{official}_labels"]
+                master_ids[name] = identity_digest(f"dermamnist-{name}-{i}" for i in range(len(images)))
+                image_array, label_array, ids = self._write_official_split(name, images, labels)
+                arrays[name] = (image_array, label_array)
+                split_ids[name] = ids
+        mean, std = self._training_statistics(arrays["train"][0])
+        class_names = self.config.evaluation.class_names
+        metadata: dict[str, Any] = {
+            "format_version": 2, "data_signature": self.config.data_signature(),
+            "split_policy": "MedMNIST official train/val/test", "master_ids": master_ids,
+            "sources": {source.name: file_digest(source)},
+            "image_size": self.config.data.image_size,
+            "class_names": list(class_names),
+            "class_to_index": {name: index for index, name in enumerate(class_names)},
+            "normalization_mean": mean, "normalization_std": std,
+            "missing_images_dropped": 0, "splits": {},
+        }
+        for name, (_, labels) in arrays.items():
+            counts = np.bincount(np.asarray(labels), minlength=len(class_names))
+            metadata["splits"][name] = {
+                "samples": int(len(labels)),
+                "class_counts": {class_names[i]: int(counts[i]) for i in range(len(class_names))},
+                "ids_sha256": identity_digest(split_ids[name]),
+            }
+        metadata["files"] = {
+            path.name: {"sha256": file_digest(path), "size_bytes": path.stat().st_size}
+            for path in self.output_dir.iterdir() if path.suffix in {".npy", ".csv"}}
+        metadata["dataset_id"] = hashlib.sha256(json.dumps(
+            {key: metadata[key] for key in ("data_signature", "sources", "master_ids", "files")},
+            sort_keys=True).encode()).hexdigest()
+        (self.output_dir / "dataset_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        self.config.save_resolved(self.output_dir)
+        for images, labels in arrays.values():
+            images._mmap.close()
+            labels._mmap.close()
+        os.rename(self.output_dir, destination)
+        self.output_dir = destination
+        return metadata
+
+
 class GalaxyDataset(TorchDataset):  # type: ignore[misc]
     """Memory-mapped processed split with lightweight tensor augmentation."""
 
@@ -445,7 +547,14 @@ def identity_digest(ids: Any) -> str:
 def validate_cache(config: AppConfig) -> dict[str, Any]:
     """Validate provenance, file integrity, shapes, labels and disjoint identities."""
     directory = config.cache_dir
-    hint = f"Run uv run --no-sync python -m scripts.preprocess_data --config configs/experiments.toml --profile {config.run.profile}. Cache: {directory}"
+    if config.data.dataset == "dermamnist":
+        hint = ("Prepare DermaMNIST with scripts.preprocess_data --config "
+                "configs/dermamnist_benchmark.toml, or scripts.compression_sweep "
+                "--config configs/dermamnist_compression.toml --stage prepare. "
+                f"Cache: {directory}")
+    else:
+        command = f"uv run --no-sync python -m scripts.preprocess_data --config configs/experiments.toml --profile {config.run.profile}"
+        hint = f"Run {command}. Cache: {directory}"
     try:
         metadata = json.loads((directory / "dataset_metadata.json").read_text(encoding="utf-8"))
         if metadata.get("format_version") != 2 or metadata.get("data_signature") != config.data_signature():
@@ -472,7 +581,7 @@ def validate_cache(config: AppConfig) -> dict[str, Any]:
             size = config.data.image_size
             if len(labels) == 0 or images.shape != (len(labels), size, size, 3) or images.dtype != np.uint8 or labels.dtype != np.int64:
                 raise ValueError(f"Invalid {split} array dimensions/dtypes")
-            if set(np.unique(labels)) != {0, 1, 2} or not np.array_equal(labels, manifest["label"].to_numpy()):
+            if set(np.unique(labels)) != set(range(len(config.evaluation.class_names))) or not np.array_equal(labels, manifest["label"].to_numpy()):
                 raise ValueError(f"Invalid {split} labels")
             ids = manifest["dr7objid"].tolist()
             if len(set(ids)) != len(ids) or all_ids.intersection(ids):

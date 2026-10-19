@@ -13,6 +13,11 @@ from typing import Any
 MODELS = ("qufex", "cnn_replacement", "direct_cnn")
 COMPRESSION_MODELS = ("compression_cnn", "compression_patch_cnn", "compression_qufex")
 CLASS_NAMES = ("smooth", "unbarred_spiral", "barred_spiral")
+DERMAMNIST_CLASS_NAMES = (
+    "actinic keratoses and intraepithelial carcinoma", "basal cell carcinoma",
+    "benign keratosis-like lesions", "dermatofibroma", "melanoma",
+    "melanocytic nevi", "vascular lesions",
+)
 
 
 class ConfigError(ValueError):
@@ -49,6 +54,7 @@ class DataConfig:
     num_workers: int = 0
     preprocessing_batch_size: int = 256
     clean_label_policy: str = "hart_clean_flags"
+    dataset: str = "galaxy_zoo"
 
 
 @dataclass(frozen=True)
@@ -238,12 +244,17 @@ class AppConfig:
         return self.architectures.direct if self.run.model == "direct_cnn" else self.architectures.shared
 
     def data_signature(self) -> dict:
-        return {key: value for key, value in asdict(self.data).items() if key not in {"num_workers", "preprocessing_batch_size"}} | {"class_names": list(self.evaluation.class_names), "format_version": 2}
+        values = {key: value for key, value in asdict(self.data).items()
+                  if key not in {"num_workers", "preprocessing_batch_size"}}
+        if self.data.dataset == "galaxy_zoo":
+            values.pop("dataset")  # Preserve identifiers of existing Galaxy Zoo caches.
+        return values | {"class_names": list(self.evaluation.class_names), "format_version": 2}
 
     @property
     def cache_dir(self) -> Path:
         digest = hashlib.sha256(json.dumps(self.data_signature(), sort_keys=True).encode()).hexdigest()[:16]
-        return self.paths.processed_dir / f"gz2-{self.data.image_size}-{digest}"
+        prefix = "gz2" if self.data.dataset == "galaxy_zoo" else self.data.dataset
+        return self.paths.processed_dir / f"{prefix}-{self.data.image_size}-{digest}"
 
     def for_model(self, model: str, seed: int | None = None) -> AppConfig:
         result = replace(self, run=replace(self.run, model=model),
@@ -254,11 +265,17 @@ class AppConfig:
     def validate(self) -> None:
         if self.run.model not in MODELS + COMPRESSION_MODELS:
             raise ConfigError(f"run.model must be one of {MODELS + COMPRESSION_MODELS}")
-        fractions = (self.data.train_fraction, self.data.validation_fraction, self.data.test_fraction)
-        if any(not 0 < x < 1 for x in fractions) or not math.isclose(sum(fractions), 1, abs_tol=1e-8):
-            raise ConfigError("Data split fractions must be positive and sum to one")
-        if self.data.clean_label_policy != "hart_clean_flags" or self.evaluation.class_names != CLASS_NAMES:
-            raise ConfigError("Only the three ordered Hart clean-flag classes are supported")
+        if self.data.dataset == "galaxy_zoo":
+            fractions = (self.data.train_fraction, self.data.validation_fraction, self.data.test_fraction)
+            if any(not 0 < x < 1 for x in fractions) or not math.isclose(sum(fractions), 1, abs_tol=1e-8):
+                raise ConfigError("Data split fractions must be positive and sum to one")
+            if self.data.clean_label_policy != "hart_clean_flags" or self.evaluation.class_names != CLASS_NAMES:
+                raise ConfigError("Galaxy Zoo requires the three ordered Hart clean-flag classes")
+        elif self.data.dataset == "dermamnist":
+            if self.data.image_size != 64 or self.data.clean_label_policy != "official_split" or self.evaluation.class_names != DERMAMNIST_CLASS_NAMES:
+                raise ConfigError("DermaMNIST requires 64×64 images, official_split and the seven official ordered classes")
+        else:
+            raise ConfigError("data.dataset must be galaxy_zoo or dermamnist")
         for section in (self.data, self.training, self.scheduler, self.evaluation, self.quantum):
             for name, value in asdict(section).items():
                 if isinstance(value, int) and not isinstance(value, bool) and value < 0:
@@ -269,8 +286,9 @@ class AppConfig:
                             ("cpu_threads", self.training.cpu_threads)):
             if value < 1:
                 raise ConfigError(f"{name} must be positive")
-        if any(0 < getattr(self.data, f"{s}_limit") < 3 for s in ("train", "validation", "test")):
-            raise ConfigError("Each subset limit must be zero (all samples) or at least three")
+        if any(0 < getattr(self.data, f"{s}_limit") < len(self.evaluation.class_names)
+               for s in ("train", "validation", "test")):
+            raise ConfigError("Each subset limit must be zero (all samples) or at least the class count")
         if not self.training.seeds or len(set(self.training.seeds)) != len(self.training.seeds) or any(s < 0 for s in self.training.seeds):
             raise ConfigError("training.seeds must contain distinct nonnegative integers")
         if self.training.optimizer not in {"adam", "adamw"} or self.training.learning_rate <= 0 or self.training.weight_decay < 0:

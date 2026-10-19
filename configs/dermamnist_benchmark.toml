@@ -1,0 +1,94 @@
+# Independent 64x64 DermaMNIST benchmark of the original three model families.
+[run]
+model = "qufex"
+profile = "full64"
+
+[paths]
+project_root = ".."
+raw_dir = "data/raw/dermamnist"
+processed_dir = "data/processed/dermamnist"
+runs_dir = "runs/dermamnist-benchmark"
+checkpoints_dir = "checkpoints/dermamnist-benchmark"
+results_dir = "results/dermamnist-benchmark"
+
+[data]
+dataset = "dermamnist"
+image_size = 64
+clean_label_policy = "official_split"
+train_limit = 0
+validation_limit = 0
+test_limit = 0
+num_workers = 0
+preprocessing_batch_size = 256
+
+[architectures.shared]
+encoder_channels = [4, 8, 8, 8, 16]
+convolutions_per_block = 2
+kernel_size = 3
+pooling = "max"
+pool_size = 2
+normalization = "batch"
+activation = "relu"
+compression_channels = 16
+quantum_spatial_size = 2
+projection = "auto"
+post_channels = [16]
+post_kernel_size = 3
+post_convolutions = 1
+classifier_hidden_neurons = [32]
+dropout = 0.2
+
+[architectures.direct]
+encoder_channels = [16, 32, 64]
+convolutions_per_block = 1
+post_channels = []
+
+[architectures.replacement]
+hidden_channels = [8]
+kernel_size = 3
+output_kernel_size = 1
+activation = "relu"
+normalization = "none"
+output_activation = "identity"
+
+[quantum]
+backend = "default.qubit"
+diff_method = "backprop"
+shots = 0
+qubits = 8
+filters = 1
+input_angle_scale = 3.141592653589793
+
+[training]
+device = "auto"
+epochs = 50
+batch_size = 8
+optimizer = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0001
+early_stopping_patience = 8
+amp = true
+class_weighting = true
+checkpoint_every = 1
+seeds = [42]
+deterministic = false
+cpu_threads = 4
+
+[scheduler]
+name = "none"
+
+[evaluation]
+batch_size = 64
+save_predictions = true
+save_confusion_matrix = true
+class_names = [
+  "actinic keratoses and intraepithelial carcinoma",
+  "basal cell carcinoma",
+  "benign keratosis-like lesions",
+  "dermatofibroma",
+  "melanoma",
+  "melanocytic nevi",
+  "vascular lesions",
+]
+
+[profiles.full64]

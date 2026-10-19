@@ -236,6 +236,67 @@ The quantum circuit follows [QuFeX v1](https://arxiv.org/html/2501.13165v1). Dat
 
 ## Staged compression study
 
+### DermaMNIST three-model benchmark
+
+[`configs/dermamnist_benchmark.toml`](configs/dermamnist_benchmark.toml) runs the
+original `qufex`, `cnn_replacement`, and `direct_cnn` architectures on the official
+64×64 DermaMNIST split. It has its own raw, processed, run, checkpoint, and result
+paths; it does not load the compression-sweep configuration. Its default is one
+training seed (42), as in the original single-seed benchmark. To report variability,
+set `training.seeds` to multiple values and allow more job time.
+
+```bash
+python -m scripts.extract_data --config configs/dermamnist_benchmark.toml
+python -m scripts.preprocess_data --config configs/dermamnist_benchmark.toml
+python -m scripts.benchmark --config configs/dermamnist_benchmark.toml
+```
+
+`scripts.benchmark` runs the three models in one process. For three independent
+Slurm array tasks, use `scripts.train --model qufex`, `--model cnn_replacement`,
+and `--model direct_cnn`, with the same config and separate `--run-dir` values.
+Each task writes its own test metrics and predictions after training. Pass the same
+`--raw-dir` and `--processed-dir` overrides to every stage on the HPC. The
+compression and benchmark configs have the same data signature, so they can reuse
+one verified DermaMNIST cache when they point to the same processed directory.
+
+The same study can run on **MedMNIST+ DermaMNIST at 64×64** using the independent
+[`configs/dermamnist_compression.toml`](configs/dermamnist_compression.toml):
+
+```bash
+# Download the official 64×64 archive (or reuse data/raw/dermamnist/dermamnist_64.npz)
+# and prepare its official train/validation/test splits.
+uv run --no-sync python -m scripts.compression_sweep \
+    --config configs/dermamnist_compression.toml --stage prepare
+
+# Run the classical compression curve first in a new study directory.
+uv run --no-sync python -m scripts.compression_sweep \
+    --config configs/dermamnist_compression.toml --stage classical \
+    --run-dir runs/dermamnist/compression-study
+
+# Continue the quantum and patch-CNN controls only after classical selection completes.
+uv run --no-sync python -m scripts.compression_sweep \
+    --config runs/dermamnist/compression-study/resolved_sweep.toml \
+    --stage quantum --run-dir runs/dermamnist/compression-study --resume
+```
+
+The loader verifies the official archive's MD5, keeps its 7,007/1,003/2,005
+train/validation/test examples in their supplied splits, and records source/checkpoint
+identities separately from Galaxy Zoo. Dataset split fractions in the shared configuration
+schema are ignored for DermaMNIST; only the official split is used. It preserves RGB images,
+computes normalization from the training split, and uses the seven official ordered labels.
+The two studies have separate caches, result directories, checkpoint directories and
+selection thresholds. Dataset-specific macro-F1 curves should be compared **within** each
+dataset. DermaMNIST is [CC BY-NC 4.0](https://medmnist.com/) and is a research benchmark,
+not intended for clinical use. The archive is from the
+[MedMNIST+ release](https://zenodo.org/records/10519652); test scores require the explicit
+`--stage evaluate` command described below.
+For the HPC, use `configs/dermamnist_compression.toml` in your existing compression
+Slurm script and give it a separate bundle path, for example
+`/data/qmla/famato/results/dermamnist-compression`. Run `--stage classical` first; it
+prepares the dataset automatically. For the next job, use the new bundle's
+`study/resolved_sweep.toml`, `--stage quantum` and `--resume`. The analysis notebook
+accepts the copied bundle through `QMLA_RESULTS_DIR`.
+
 The independent [`configs/compression_sweep.toml`](configs/compression_sweep.toml) configures
 [`scripts/compression_sweep.py`](scripts/compression_sweep.py). It does not inherit settings
 from `experiments.toml`. Its defaults are full 64×64 images, seeds **42, 1324, 987654**,

@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from qmla.config import AppConfig, MODELS
-from qmla.data import GalaxyZooPreprocessor
+from qmla.data import DermaMNISTPreprocessor, GalaxyZooPreprocessor
 from qmla.engine import Evaluator, Trainer
 from qmla.runtime import process_started_at_utc
 
@@ -25,7 +25,8 @@ def run_experiments(config: AppConfig, *, benchmark: bool = False,
     for model in models:
         config.for_model(model)
     if not config.cache_dir.exists():
-        GalaxyZooPreprocessor(config).run()
+        preprocessor = DermaMNISTPreprocessor if config.data.dataset == "dermamnist" else GalaxyZooPreprocessor
+        preprocessor(config).run()
     tag = "benchmark" if benchmark else config.run.model
     root = run_dir or config.paths.runs_dir / f"{tag}_{config.run.profile}_{datetime.now():%Y%m%d_%H%M%S_%f}"
     root = root.resolve()
