@@ -55,6 +55,23 @@ class ConvBlock(nn.Module):
         return self.block(inputs)
 
 
+class SpatialPyramidPooling(nn.Module):
+    """Concatenate spatial averages from several grid sizes."""
+
+    def __init__(self, grid_sizes: tuple[int, ...]) -> None:
+        super().__init__()
+        self.grid_sizes = grid_sizes
+        self.pools = nn.ModuleList(nn.AdaptiveAvgPool2d(size) for size in grid_sizes)
+        self.output_multiplier = sum(size**2 for size in grid_sizes)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if max(self.grid_sizes) > min(inputs.shape[-2:]):
+            raise ValueError("Pooling grids cannot exceed the input dimensions")
+
+        pooled = [pool(inputs).flatten(1) for pool in self.pools]
+        return torch.cat(pooled, dim=1)
+
+
 class QuFeXLayer(nn.Module):
     """Published 8(1), 4(1), or 4(2) QuFeX over a [B, 16, 2, 2] bottleneck."""
 
@@ -334,10 +351,10 @@ class GalaxyClassifier(nn.Module):
                                          kernel_size=arch.post_kernel_size, norm=arch.normalization, act=arch.activation))
             current_channels = channels
         self.post_quantum = nn.Sequential(*post_layers)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_pool = SpatialPyramidPooling(arch.classifier_pool_sizes)
 
         head: list[nn.Module] = []
-        current_features = current_channels
+        current_features = current_channels * self.global_pool.output_multiplier
         for hidden in arch.classifier_hidden_neurons:
             head.extend([nn.Linear(current_features, hidden), activation(arch.activation), nn.Dropout(arch.dropout)])
             current_features = hidden
@@ -367,5 +384,7 @@ class GalaxyClassifier(nn.Module):
         elif self.replacement is not None:
             features = residual_for_filters(features, self.filters) + self.replacement(features)
         features = self.post_quantum(features)
-        features = self.global_pool(features).flatten(1)
+        features = self.global_pool(features)
         return self.classifier(features)
+
+

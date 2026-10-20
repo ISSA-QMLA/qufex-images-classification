@@ -73,6 +73,7 @@ class ArchitectureConfig:
     post_channels: tuple[int, ...] = (16,)
     post_kernel_size: int = 3
     post_convolutions: int = 1
+    classifier_pool_sizes: tuple[int, ...] = (1,)
     classifier_hidden_neurons: tuple[int, ...] = (32,)
     dropout: float = 0.2
     circuit_chunk_size: int = 256
@@ -323,6 +324,11 @@ class AppConfig:
                 raise ConfigError(f"architectures.{label}: pool_blocks must be -1 or between zero and the encoder depth")
             if any(k < 1 or k % 2 == 0 for k in (arch.kernel_size, arch.post_kernel_size)):
                 raise ConfigError("Convolution kernels must be positive odd integers")
+            if (not arch.classifier_pool_sizes 
+                or any(size < 1 for size in arch.classifier_pool_sizes)
+                or len(set(arch.classifier_pool_sizes)) != len(arch.classifier_pool_sizes)
+            ):
+                raise ConfigError(f"architectures.{label}: classifier_pool_sizes must contain distinct positive integres")
         arch = self.architecture
         spatial = arch.encoder_spatial_size(self.data.image_size)
         if spatial < 1:
